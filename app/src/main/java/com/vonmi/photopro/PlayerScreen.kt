@@ -70,7 +70,7 @@ fun Context.findActivity(): Activity? {
 @Composable
 fun PlayerScreen(onClose: () -> Unit, initialUri: Uri? = null, initialText: String? = null) {
     val sharedUrl = initialText?.let { Regex("https?://\\S+").find(it)?.value }
-    val isYt = { u: String -> u.contains("youtube.com") || u.contains("youtu.be") }
+    val isYt = { u: String -> youTubeWebUrl(u) != null }
     val startUri = initialUri ?: sharedUrl?.takeIf { !isYt(it) }?.let { Uri.parse(it) }
     val startYt = (initialUri?.toString()?.takeIf { isYt(it) }) ?: sharedUrl?.takeIf { isYt(it) }
     val direct = startUri != null && startYt == null
@@ -145,12 +145,18 @@ private fun LocalVideos(onPlay: (Uri) -> Unit, onYouTube: (String) -> Unit) {
                 val l = link.trim()
                 if (l.isNotEmpty()) {
                     val url = if (l.startsWith("http")) l else "https://$l"
-                    if (url.contains("youtube.com") || url.contains("youtu.be")) onYouTube(url) else onPlay(Uri.parse(url))
+                    if (youTubeWebUrl(url) != null) onYouTube(url) else onPlay(Uri.parse(url))
                 }
             }) { Text("Lire", color = Color.Black) }
         }
         Row(Modifier.padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { openDoc.launch(arrayOf("video/*")) }) { Text("📂 Ouvrir un fichier") }
+            OutlinedButton(onClick = { openDoc.launch(arrayOf("video/*")) }) { Text("📂 Fichier") }
+            OutlinedButton(onClick = {
+                val i = if (Build.VERSION.SDK_INT >= 31)
+                    Intent(android.provider.Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS, Uri.parse("package:" + ctx.packageName))
+                else Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName))
+                runCatching { ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            }) { Text("🔗 Liens YouTube") }
             if (!hasPerm) OutlinedButton(onClick = { permLauncher.launch(perm) }) { Text("Voir toutes les vidéos") }
         }
         val list = videos
@@ -309,12 +315,21 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
     val web = remember {
         WebView(ctx).apply {
             settings.javaScriptEnabled = true
+            // YouTube refuse parfois la lecture dans une « WebView » : on se présente comme Chrome mobile
+            settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\S+ "), "")
+            settings.loadWithOverviewMode = true
+            settings.useWideViewPort = true
+            android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val scheme = request.url.scheme
                     if (scheme == "http" || scheme == "https") return false
+                    // Liens qui voudraient ouvrir l'appli YouTube : on reste dans Photo Pro
+                    val inApp = youTubeWebUrl(request.url.toString())
+                    if (inApp != null) { view.loadUrl(inApp); return true }
                     runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, request.url).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
                     return true
                 }
@@ -330,10 +345,13 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
                     activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 }
             }
-            loadUrl(startUrl)
+            loadUrl(youTubeWebUrl(startUrl) ?: startUrl)
         }
     }
-    LaunchedEffect(startUrl) { if (web.url != startUrl) web.loadUrl(startUrl) }
+    LaunchedEffect(startUrl) {
+        val u = youTubeWebUrl(startUrl) ?: startUrl
+        if (web.url != u) web.loadUrl(u)
+    }
     DisposableEffect(Unit) {
         web.onResume()
         onDispose {
@@ -362,4 +380,31 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
             AndroidView(factory = { cv }, modifier = Modifier.fillMaxSize().background(Color.Black))
         }
     }
+}
+
+
+/** Convertit tout lien YouTube (youtu.be, shorts, vnd.youtube:, intent://, music…) en page m.youtube.com. */
+fun youTubeWebUrl(raw: String): String? {
+    val u = raw.trim()
+    if (u.startsWith("intent://")) {
+        Regex("S\\.browser_fallback_url=([^;]+)").find(u)?.groupValues?.get(1)?.let { return Uri.decode(it) }
+        val path = u.removePrefix("intent://").substringBefore("#Intent")
+        return youTubeWebUrl("https://$path")
+    }
+    if (u.startsWith("vnd.youtube:")) {
+        val id = u.removePrefix("vnd.youtube:").removePrefix("//").substringBefore("?")
+        return "https://m.youtube.com/watch?v=$id"
+    }
+    val uri = runCatching { Uri.parse(u) }.getOrNull() ?: return null
+    val host = uri.host?.lowercase() ?: return null
+    val id: String? = when {
+        host.endsWith("youtu.be") -> uri.pathSegments.firstOrNull()
+        host.contains("youtube.com") && (uri.pathSegments.firstOrNull() ?: "") in listOf("shorts", "live", "embed") ->
+            uri.pathSegments.getOrNull(1)
+        host.contains("youtube.com") -> uri.getQueryParameter("v")
+        else -> return null
+    }
+    if (id.isNullOrBlank()) return if (host.contains("youtube.com")) u.replace("://www.", "://m.").replace("://music.", "://m.") else null
+    val t = uri.getQueryParameter("t")?.let { "&t=$it" } ?: ""
+    return "https://m.youtube.com/watch?v=$id$t"
 }

@@ -41,6 +41,8 @@
         <activity
             android:name=".PlayerActivity"
             android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:taskAffinity="com.vonmi.photopro.lecteur"
             android:label="Lecteur Photo Pro"
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
@@ -53,6 +55,45 @@
                 <data android:scheme="http" />
                 <data android:scheme="https" />
                 <data android:mimeType="video/*" />
+            </intent-filter>
+            <!-- Icône séparée « Lecteur Photo Pro » -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Flux vidéo (HLS, DASH) et vidéos sans type précis -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:mimeType="application/x-mpegURL" />
+                <data android:mimeType="application/vnd.apple.mpegurl" />
+                <data android:mimeType="application/dash+xml" />
+                <data android:mimeType="application/mp4" />
+                <data android:mimeType="application/x-matroska" />
+            </intent-filter>
+            <!-- Liens YouTube -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:host="youtube.com" />
+                <data android:host="www.youtube.com" />
+                <data android:host="m.youtube.com" />
+                <data android:host="music.youtube.com" />
+                <data android:host="youtu.be" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="vnd.youtube" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
