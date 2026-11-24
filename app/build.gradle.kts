@@ -12,8 +12,8 @@ android {
         applicationId = "com.vonmi.photopro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "3.1"
+        versionCode = 12
+        versionName = "3.2"
         // Seulement les processeurs 64 bits ARM (tous les téléphones récents) : APK bien plus léger
         ndk { abiFilters += listOf("arm64-v8a") }
     }

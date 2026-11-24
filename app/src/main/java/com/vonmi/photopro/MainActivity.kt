@@ -88,7 +88,8 @@ private fun rememberUiRotation(deviceRot: Int): Float {
     }
     return animateFloatAsState(target, tween(280), label = "rot").value
 }
-private val Panel = Color(0xFF16181D)
+private val Panel = Color(0x8C16181D)
+private val PanelSolid = Color(0xE616181D)
 private val Dim = Color(0xFF9AA0AA)
 
 class MainActivity : ComponentActivity() {
@@ -428,7 +429,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
         // ---------- Barre du haut ----------
         if (!uiHidden) Column(
             Modifier.fillMaxWidth().align(Alignment.TopCenter)
-                .background(Brush.verticalGradient(listOf(Color(0xAA000000), Color.Transparent)))
+                .background(Brush.verticalGradient(listOf(Color(0x66000000), Color.Transparent)))
                 .windowInsetsPadding(WindowInsets.displayCutout).padding(top = 8.dp)
         ) {
             Row(
@@ -577,7 +578,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
         // ---------- Commandes du bas ----------
         if (!uiHidden) Column(
             Modifier.fillMaxWidth().align(Alignment.BottomCenter)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000), Color(0xEE000000))))
+                .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x55000000), Color(0x88000000))))
                 .navigationBarsPadding().padding(top = 24.dp)
         ) {
             if (qr != null) Row(
@@ -916,7 +917,7 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
         onDismissRequest = onClose,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
     ) {
-        Column(Modifier.fillMaxSize().background(Color(0xFF0B0C0F)).systemBarsPadding()) {
+        Column(Modifier.fillMaxSize().background(Color(0xB30B0C0F)).systemBarsPadding()) {
             // En-tête
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onClose) { Text("←", color = Color.White, fontSize = 22.sp) }
@@ -1041,7 +1042,7 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
 @Composable
 private fun Section(icon: String, title: String, content: @Composable ColumnScope.() -> Unit) {
     Column(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Panel).padding(14.dp),
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Color(0xCC16181D)).padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text("$icon  $title", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
