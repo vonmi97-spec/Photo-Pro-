@@ -39,6 +39,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -183,10 +184,10 @@ private fun CameraScreen(ctrl: CameraController) {
         Text(info, color = Dim, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
 
         // ---------- Aperçu ----------
-        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+        Box(Modifier.weight(1f).fillMaxWidth().clipToBounds(), contentAlignment = Alignment.Center) {
             val ratio = caps?.let { it.previewSize.height.toFloat() / it.previewSize.width } ?: 0.75f
             Box(
-                Modifier.fillMaxWidth().aspectRatio(ratio, matchHeightConstraintsFirst = false)
+                Modifier.aspectRatio(ratio, matchHeightConstraintsFirst = true)
                     .pointerInput(Unit) {
                         detectTapGestures(
                             onTap = { o -> ctrl.tapToFocus(o.x / size.width, o.y / size.height) },
