@@ -317,10 +317,16 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
             settings.javaScriptEnabled = true
             // YouTube refuse parfois la lecture dans une « WebView » : on se présente comme Chrome mobile
             settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\S+ "), "")
-            settings.loadWithOverviewMode = true
-            settings.useWideViewPort = true
-            android.webkit.CookieManager.getInstance().setAcceptCookie(true)
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            val cm = android.webkit.CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(this, true)
+            // Consentement déjà donné (« refuser les cookies non essentiels ») : évite le bandeau qui bloque la page
+            for (host in listOf("https://www.youtube.com", "https://m.youtube.com", "https://youtube.com")) {
+                cm.setCookie(host, "SOCS=CAI; Domain=.youtube.com; Path=/; Secure; Max-Age=31536000")
+                cm.setCookie(host, "CONSENT=PENDING+987; Domain=.youtube.com; Path=/; Secure; Max-Age=31536000")
+            }
+            cm.flush()
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
             webViewClient = object : WebViewClient() {
