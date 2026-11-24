@@ -79,6 +79,10 @@ data class CamSettings(
     val videoAudio: Boolean = true,
     val sceneAnalysis: Boolean = true,
     val sceneAuto: Boolean = true,
+    val fillPreview: Boolean = true,
+    val faces: Boolean = true,
+    val qr: Boolean = true,
+    val histogram: Boolean = false,
 )
 
 data class CamCaps(
@@ -113,6 +117,7 @@ data class CamCaps(
     val fps60: Range<Int>?,
     val videoStab: Boolean,
     val sceneModes: List<Int>,
+    val faceMode: Int,
 )
 
 data class LensInfo(
@@ -180,6 +185,18 @@ class CameraController(private val ctx: Context) {
     var recording by mutableStateOf(false); private set
     var recSeconds by mutableStateOf(0); private set
     var lastIsVideo by mutableStateOf(false); private set
+    var recPaused by mutableStateOf(false); private set
+    var burstCount by mutableStateOf(0); private set
+    var locked by mutableStateOf(false); private set
+    var faces by mutableStateOf<List<android.graphics.RectF>>(emptyList()); private set
+    var histogram by mutableStateOf<FloatArray?>(null); private set
+    var qrText by mutableStateOf<String?>(null)
+    var qrIsUrl by mutableStateOf(false)
+    @Volatile private var burstActive = false
+    @Volatile private var lockedFlag = false
+    private var pausedAccum = 0L
+    private var pausedAt = 0L
+    private var lastFaces = 0L
 
     @Volatile private var cfg: CamSettings = settings
     @Volatile private var cur: CamCaps? = null
@@ -218,7 +235,9 @@ class CameraController(private val ctx: Context) {
     private val recTick = object : Runnable {
         override fun run() {
             if (!recording) return
-            recSeconds = ((SystemClock.elapsedRealtime() - recStartedAt) / 1000).toInt()
+            val now = SystemClock.elapsedRealtime()
+            val paused = pausedAccum + if (recPaused) now - pausedAt else 0L
+            recSeconds = ((now - recStartedAt - paused) / 1000).toInt()
             main.postDelayed(this, 500)
         }
     }
@@ -339,7 +358,10 @@ class CameraController(private val ctx: Context) {
                 post("Échec de l'enregistrement")
             } finally {
                 img.close()
-                main.post { busy = false }
+                if (burstActive) {
+                    main.post { burstCount++; if (burstCount >= MAX_BURST) stopBurst() }
+                    bg.postDelayed({ if (burstActive) still() else main.post { busy = false } }, 30)
+                } else main.post { busy = false }
             }
         }, bg)
         reader = r
@@ -492,7 +514,14 @@ class CameraController(private val ctx: Context) {
             id, front, "$dir$lens", orient, manual, iso, exp, minFocus, awb, af, fx,
             evR, evS, zMin, zMax, useRatio, flash, ois, active, maxAf, maxAe, jpeg, prev, aperture, focal,
             video, heights, f30, f60, vstab,
-            ch.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)?.toList() ?: emptyList()
+            ch.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)?.toList() ?: emptyList(),
+            ch.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES)?.let { m ->
+                when {
+                    m.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE) -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE
+                    m.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL) -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL
+                    else -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+                }
+            } ?: CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
         )
     }
 
@@ -545,11 +574,40 @@ class CameraController(private val ctx: Context) {
     fun resetFocus() {
         tapRegion = null
         focusPoint = null
+        lockedFlag = false
+        locked = false
         bg.post { updatePreview() }
     }
 
+    /** Appui long : mise au point + exposition verrouillées à cet endroit. */
+    fun lockAt(x: Float, y: Float) {
+        if (settings.pro || settings.manualFocus) return
+        tapToFocus(x, y, lock = true)
+        message = "🔒 Exposition et mise au point verrouillées"
+    }
+
+    /** Coordonnées capteur → coordonnées écran (0..1), inverse de tapToFocus. */
+    private fun mapRect(c: CamCaps, r: Rect): android.graphics.RectF {
+        val a = c.activeArray
+        fun conv(px: Int, py: Int): Pair<Float, Float> {
+            val sx = (px - a.left).toFloat() / a.width()
+            val sy = (py - a.top).toFloat() / a.height()
+            return when (c.sensorOrientation) {
+                90 -> if (c.front) Pair(sy, sx) else Pair(1f - sy, sx)
+                270 -> if (c.front) Pair(1f - sy, 1f - sx) else Pair(sy, 1f - sx)
+                180 -> Pair(1f - sx, 1f - sy)
+                else -> Pair(sx, sy)
+            }
+        }
+        val (x1, y1) = conv(r.left, r.top)
+        val (x2, y2) = conv(r.right, r.bottom)
+        return android.graphics.RectF(minOf(x1, x2), minOf(y1, y2), maxOf(x1, x2), maxOf(y1, y2))
+    }
+
     /** Appui sur l'aperçu : mise au point + mesure à cet endroit (x, y entre 0 et 1). */
-    fun tapToFocus(x: Float, y: Float) {
+    fun tapToFocus(x: Float, y: Float, lock: Boolean = false) {
+        lockedFlag = lock
+        locked = lock
         val c = cur ?: return
         if (settings.manualFocus) return
         val (sx, sy) = when (c.sensorOrientation) {
@@ -586,6 +644,13 @@ class CameraController(private val ctx: Context) {
     private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             val now = SystemClock.elapsedRealtime()
+            val c = cur
+            if (c != null && cfg.faces && now - lastFaces > 100) {
+                lastFaces = now
+                val fs = res.get(CaptureResult.STATISTICS_FACES)
+                val mapped = fs?.filter { it.score >= 30 }?.map { mapRect(c, it.bounds) } ?: emptyList()
+                if (mapped.isNotEmpty() || faces.isNotEmpty()) main.post { faces = mapped }
+            }
             if (now - lastLive < 250) return
             lastLive = now
             val info = LiveInfo(
@@ -694,6 +759,23 @@ class CameraController(private val ctx: Context) {
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
         }
         if (region != null && c.maxAeRegions > 0 && !s.pro) b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+
+        // Verrouillage expo / balance des blancs
+        if (lockedFlag && !s.pro) {
+            b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+            b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+        }
+        // Détection des visages
+        if (s.faces && c.faceMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
+            b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, c.faceMode)
+            if (b.get(CaptureRequest.CONTROL_MODE) != CameraMetadata.CONTROL_MODE_USE_SCENE_MODE &&
+                c.sceneModes.contains(CameraMetadata.CONTROL_SCENE_MODE_FACE_PRIORITY) &&
+                !s.pro && !s.manualFocus && tapRegion == null
+            ) {
+                b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+                b.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_FACE_PRIORITY)
+            }
+        }
 
         // Couleur
         b.set(CaptureRequest.CONTROL_AWB_MODE, s.awb)
@@ -810,6 +892,78 @@ class CameraController(private val ctx: Context) {
     }
 
     // ------------------------------------------------------------------
+    // Rafale
+
+    fun startBurst() {
+        if (settings.video || busy || session == null || externalRequest != null) return
+        burstCount = 0
+        busy = true
+        burstActive = true
+        pendingOrientation = deviceRotation
+        bg.post { still() }
+    }
+
+    fun stopBurst() {
+        if (!burstActive) return
+        burstActive = false
+        main.postDelayed({ message = "Rafale : $burstCount photos" }, 300)
+    }
+
+    // ------------------------------------------------------------------
+    // Vidéo : pause et photo pendant l'enregistrement
+
+    fun togglePause() {
+        val r = recorder ?: return
+        if (!recording) return
+        try {
+            if (recPaused) {
+                r.resume()
+                pausedAccum += SystemClock.elapsedRealtime() - pausedAt
+                recPaused = false
+            } else {
+                r.pause()
+                pausedAt = SystemClock.elapsedRealtime()
+                recPaused = true
+            }
+        } catch (e: Exception) { message = "Pause impossible" }
+    }
+
+    /** Enregistre l'image affichée (photo pendant une vidéo). */
+    fun saveSnapshot(bmp: Bitmap) {
+        val rot = if (cur?.front == true) (360 - deviceRotation) % 360 else deviceRotation
+        flashScreen++
+        bg.post {
+            val out = if (rot != 0) Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot.toFloat()) }, true) else bmp
+            val bos = java.io.ByteArrayOutputStream()
+            out.compress(Bitmap.CompressFormat.JPEG, cfg.quality, bos)
+            val ext = externalRequest
+            externalRequest = null
+            try { saveJpeg(bos.toByteArray()) } finally { externalRequest = ext }
+            post("Photo enregistrée")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Histogramme
+
+    fun computeHistogram(bmp: Bitmap) {
+        val w = bmp.width; val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        val bins = FloatArray(64)
+        var i = 0
+        while (i < px.size) {
+            val p = px[i]
+            val l = (((p shr 16) and 0xFF) * 77 + ((p shr 8) and 0xFF) * 150 + (p and 0xFF) * 29) shr 8
+            bins[l shr 2] += 1f
+            i += 3
+        }
+        val m = bins.maxOrNull() ?: 1f
+        if (m > 0f) for (k in bins.indices) bins[k] /= m
+        histogram = bins
+    }
+
+    // ------------------------------------------------------------------
     // Analyse de scène
 
     fun onSceneLabels(labels: List<Pair<String, Float>>) {
@@ -911,6 +1065,7 @@ class CameraController(private val ctx: Context) {
                         ss.setRepeatingRequest(b.build(), previewCallback, bg)
                         r.start()
                         recStartedAt = SystemClock.elapsedRealtime()
+                        pausedAccum = 0L
                         main.post { recording = true; recSeconds = 0; main.post(recTick) }
                         if (cfg.sound) main.post { sound.play(MediaActionSound.START_VIDEO_RECORDING) }
                     } catch (e: Exception) {
@@ -942,7 +1097,7 @@ class CameraController(private val ctx: Context) {
         recPfd = null
         try { session?.close() } catch (_: Exception) {}
         session = null
-        main.post { recording = false; main.removeCallbacks(recTick) }
+        main.post { recording = false; recPaused = false; main.removeCallbacks(recTick) }
         if (uri == null) return
         val resolver = ctx.contentResolver
         val ext = externalRequest
@@ -1051,6 +1206,10 @@ class CameraController(private val ctx: Context) {
             videoAudio = prefs.getBoolean("vaudio", d.videoAudio),
             sceneAnalysis = prefs.getBoolean("scene", d.sceneAnalysis),
             sceneAuto = prefs.getBoolean("sceneAuto", d.sceneAuto),
+            fillPreview = prefs.getBoolean("fill", d.fillPreview),
+            faces = prefs.getBoolean("faces", d.faces),
+            qr = prefs.getBoolean("qr", d.qr),
+            histogram = prefs.getBoolean("histo", d.histogram),
         )
     }
 
@@ -1065,11 +1224,14 @@ class CameraController(private val ctx: Context) {
             .putBoolean("video", s.video).putInt("vres", s.videoRes).putBoolean("fps60", s.fps60)
             .putBoolean("vaudio", s.videoAudio)
             .putBoolean("scene", s.sceneAnalysis).putBoolean("sceneAuto", s.sceneAuto)
+            .putBoolean("fill", s.fillPreview).putBoolean("faces", s.faces).putBoolean("qr", s.qr)
+            .putBoolean("histo", s.histogram)
             .apply()
     }
 
     companion object {
         const val PREVIEW_MAX_EXP = 66_000_000L // 1/15 s
+        const val MAX_BURST = 30
     }
 }
 

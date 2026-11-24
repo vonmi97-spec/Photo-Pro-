@@ -56,6 +56,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.compose.ui.graphics.Brush
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -77,6 +81,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        goFullScreen()
         ctrl = CameraController(applicationContext)
         granted.value = hasCameraPermission()
         handleCaptureIntent(intent)
@@ -113,6 +118,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Plein écran (barres système masquées, encoche utilisée) + taux de rafraîchissement maximal (120 Hz). */
+    private fun goFullScreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= 28) {
+            window.attributes = window.attributes.also {
+                it.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        runCatching {
+            @Suppress("DEPRECATION")
+            val d = if (Build.VERSION.SDK_INT >= 30) display!! else windowManager.defaultDisplay
+            val cur = d.mode
+            val best = d.supportedModes
+                .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                .maxByOrNull { it.refreshRate }
+            if (best != null) window.attributes = window.attributes.also { it.preferredDisplayModeId = best.modeId }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) WindowInsetsControllerCompat(window, window.decorView).hide(WindowInsetsCompat.Type.systemBars())
+    }
+
     private fun hasCameraPermission() =
         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
@@ -143,8 +176,8 @@ private fun Root(ctrl: CameraController, granted: MutableState<Boolean>) {
     LaunchedEffect(Unit) { if (!granted.value) launcher.launch(perms) }
 
     var player by remember { mutableStateOf(false) }
-    Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
-        if (player) PlayerScreen(onClose = { player = false })
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        if (player) Box(Modifier.fillMaxSize().systemBarsPadding()) { PlayerScreen(onClose = { player = false }) }
         else if (granted.value) CameraScreen(ctrl, onOpenPlayer = { player = true })
         else Column(
             Modifier.fillMaxSize().padding(32.dp),
@@ -173,19 +206,28 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var param by remember { mutableStateOf(Param.ZOOM) }
     var showSettings by remember { mutableStateOf(false) }
+    var showPanel by remember { mutableStateOf(true) }
 
     var textureRef by remember { mutableStateOf<TextureView?>(null) }
     val analyzer = remember { SceneAnalyzer() }
     DisposableEffect(Unit) { onDispose { analyzer.close() } }
-    LaunchedEffect(s.sceneAnalysis, s.pro, textureRef) {
+    val wantScene = s.sceneAnalysis && !s.pro
+    LaunchedEffect(wantScene, s.qr, s.histogram, textureRef) {
         val tv = textureRef ?: return@LaunchedEffect
-        if (!s.sceneAnalysis || s.pro) { ctrl.clearScene(); return@LaunchedEffect }
+        if (!wantScene) ctrl.clearScene()
+        if (!wantScene && !s.qr && !s.histogram) return@LaunchedEffect
         while (true) {
-            delay(1200)
+            delay(if (s.histogram) 600 else 1000)
             if (!tv.isAvailable || tv.width == 0) continue
-            val h = (256f * tv.height / tv.width).roundToInt().coerceAtLeast(1)
-            val bmp = runCatching { tv.getBitmap(256, h) }.getOrNull() ?: continue
-            analyzer.analyze(bmp) { ctrl.onSceneLabels(it) }
+            val w = if (s.qr) 720 else 256
+            val h = (w.toFloat() * tv.height / tv.width).roundToInt().coerceAtLeast(1)
+            val bmp = runCatching { tv.getBitmap(w, h) }.getOrNull() ?: continue
+            if (s.histogram) ctrl.computeHistogram(bmp)
+            analyzer.analyze(
+                bmp, labels = wantScene, barcodes = s.qr,
+                onLabels = { ctrl.onSceneLabels(it) },
+                onBarcode = { text, url -> if (text != null) { ctrl.qrText = text; ctrl.qrIsUrl = url } }
+            )
         }
     }
 
@@ -198,83 +240,92 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
 
     val msg = ctrl.message
     LaunchedEffect(msg) { if (msg != null) { delay(2500); ctrl.message = null } }
+    val qr = ctrl.qrText
+    LaunchedEffect(qr) { if (qr != null) { delay(8000); ctrl.qrText = null } }
 
-    Column(Modifier.fillMaxSize()) {
-        // ---------- Barre du haut ----------
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+    BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
+        // ---------- Aperçu plein écran ----------
+        val ratio = caps?.let { it.previewSize.height.toFloat() / it.previewSize.width } ?: 0.75f
+        val screenW = maxWidth; val screenH = maxHeight
+        val fill = s.fillPreview
+        val (pw, ph) = if ((screenW / screenH > ratio) == fill) Pair(screenW, screenW / ratio) else Pair(screenH * ratio, screenH)
+        Box(
+            Modifier.requiredSize(pw, ph).align(if (fill) Alignment.Center else Alignment.TopCenter)
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { o -> ctrl.tapToFocus(o.x / size.width, o.y / size.height) },
+                        onLongPress = { o -> ctrl.lockAt(o.x / size.width, o.y / size.height) },
+                        onDoubleTap = { ctrl.switchCamera() }
+                    )
+                }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, _, zoom, _ ->
+                        val c = ctrl.caps ?: return@detectTransformGestures
+                        val cur = ctrl.settings
+                        val z = (cur.zoom * zoom).coerceIn(c.zoomMin, c.zoomMax)
+                        if (abs(z - cur.zoom) > 0.005f) ctrl.update(cur.copy(zoom = z))
+                    }
+                }
         ) {
-            TopButton("⚡ ${s.flash.label}", enabled = caps?.hasFlash == true, active = s.flash != FlashMode.OFF) {
-                val next = FlashMode.entries[(s.flash.ordinal + 1) % FlashMode.entries.size]
-                ctrl.update(s.copy(flash = next))
-            }
-            TopButton(if (s.timer == 0) "⏱ Off" else "⏱ ${s.timer}s", enabled = !s.video, active = s.timer > 0) {
-                val next = when (s.timer) { 0 -> 3; 3 -> 10; else -> 0 }
-                ctrl.update(s.copy(timer = next))
-            }
-            TopButton("#", active = s.grid) { ctrl.update(s.copy(grid = !s.grid)) }
-            if (s.video) TopButton(if (s.videoRes == 2160) "4K" else "${s.videoRes}p", active = false, enabled = !ctrl.recording) {
-                val opts = caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)
-                val i = opts.indexOf(s.videoRes)
-                ctrl.update(s.copy(videoRes = opts[(i + 1) % opts.size]))
-            } else TopButton(if (s.wide) "16:9" else "4:3", active = false) { ctrl.update(s.copy(wide = !s.wide)) }
-            TopButton("▶ Lecteur", active = false, enabled = !ctrl.recording) { onOpenPlayer() }
-            IconButton(onClick = { showSettings = true }) {
-                Icon(Icons.Default.Settings, contentDescription = "Réglages", tint = Color.White)
-            }
-        }
-
-        // ---------- Infos ----------
-        val info = buildString {
-            if (caps != null) append(caps.label)
-            if (caps?.aperture != null) append(" · f/${fmt1(caps.aperture)}")
-            append("   ")
-            if (s.video) append("${if (s.videoRes == 2160) "4K" else "${s.videoRes}p"} · ${if (s.fps60 && caps?.fps60 != null) 60 else 30} i/s")
-            else if (s.pro) append("ISO ${s.iso} · ${formatShutter(s.exposureNs)}")
-            else if (ctrl.live.iso > 0) append("ISO ${ctrl.live.iso} · ${formatShutter(ctrl.live.expNs)}")
-        }
-        Text(info, color = Dim, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
-
-        // ---------- Aperçu ----------
-        Box(Modifier.weight(1f).fillMaxWidth().clipToBounds(), contentAlignment = Alignment.Center) {
-            val ratio = caps?.let { it.previewSize.height.toFloat() / it.previewSize.width } ?: 0.75f
-            Box(
-                Modifier.aspectRatio(ratio, matchHeightConstraintsFirst = true)
-                    .pointerInput(Unit) {
-                        detectTapGestures(
-                            onTap = { o -> ctrl.tapToFocus(o.x / size.width, o.y / size.height) },
-                            onLongPress = { ctrl.resetFocus(); ctrl.message = "Mise au point automatique" },
-                            onDoubleTap = { ctrl.switchCamera() }
-                        )
-                    }
-                    .pointerInput(Unit) {
-                        detectTransformGestures { _, _, zoom, _ ->
-                            val c = ctrl.caps ?: return@detectTransformGestures
-                            val cur = ctrl.settings
-                            val z = (cur.zoom * zoom).coerceIn(c.zoomMin, c.zoomMax)
-                            if (abs(z - cur.zoom) > 0.005f) ctrl.update(cur.copy(zoom = z))
+            AndroidView(
+                factory = { c ->
+                    TextureView(c).also { textureRef = it }.apply {
+                        surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = ctrl.attachSurface(st)
+                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { ctrl.detachSurface(); return true }
+                            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
                         }
                     }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            Overlay(ctrl)
+        }
+
+        // ---------- Barre du haut ----------
+        Column(
+            Modifier.fillMaxWidth().align(Alignment.TopCenter)
+                .background(Brush.verticalGradient(listOf(Color(0xAA000000), Color.Transparent)))
+                .windowInsetsPadding(WindowInsets.displayCutout).padding(top = 8.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                AndroidView(
-                    factory = { c ->
-                        TextureView(c).also { textureRef = it }.apply {
-                            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = ctrl.attachSurface(st)
-                                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-                                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { ctrl.detachSurface(); return true }
-                                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-                            }
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
-                Overlay(ctrl)
-                if (s.sceneAnalysis && !s.pro) {
-                    val sc = ctrl.scene
-                    Column(Modifier.align(Alignment.TopStart).padding(8.dp)) {
+                TopButton("⚡ ${s.flash.label}", enabled = caps?.hasFlash == true, active = s.flash != FlashMode.OFF) {
+                    val next = FlashMode.entries[(s.flash.ordinal + 1) % FlashMode.entries.size]
+                    ctrl.update(s.copy(flash = next))
+                }
+                TopButton(if (s.timer == 0) "⏱ Off" else "⏱ ${s.timer}s", enabled = !s.video, active = s.timer > 0) {
+                    val next = when (s.timer) { 0 -> 2; 2 -> 5; 5 -> 10; else -> 0 }
+                    ctrl.update(s.copy(timer = next))
+                }
+                if (s.video) TopButton(if (s.videoRes == 2160) "4K" else "${s.videoRes}p", active = false, enabled = !ctrl.recording) {
+                    val opts = caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)
+                    val i = opts.indexOf(s.videoRes)
+                    ctrl.update(s.copy(videoRes = opts[(i + 1) % opts.size]))
+                } else TopButton(if (s.wide) "16:9" else "4:3", active = false) { ctrl.update(s.copy(wide = !s.wide)) }
+                TopButton(if (fill) "⛶ Plein" else "▭ Cadre", active = false) { ctrl.update(s.copy(fillPreview = !fill)) }
+                TopButton("▶", active = false, enabled = !ctrl.recording) { onOpenPlayer() }
+                IconButton(onClick = { showSettings = true }) {
+                    Icon(Icons.Default.Settings, contentDescription = "Réglages", tint = Color.White)
+                }
+            }
+            val info = buildString {
+                if (caps != null) append(caps.label)
+                if (caps?.aperture != null) append(" · f/${fmt1(caps.aperture)}")
+                append("   ")
+                if (s.video) append("${if (s.videoRes == 2160) "4K" else "${s.videoRes}p"} · ${if (s.fps60 && caps?.fps60 != null) 60 else 30} i/s")
+                else if (s.pro) append("ISO ${s.iso} · ${formatShutter(s.exposureNs)}")
+                else if (ctrl.live.iso > 0) append("ISO ${ctrl.live.iso} · ${formatShutter(ctrl.live.expNs)}")
+            }
+            Text(info, color = Color(0xDDFFFFFF), fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
+            Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.Top) {
+                Column(Modifier.weight(1f)) {
+                    if (wantScene) {
+                        val sc = ctrl.scene
                         Text(
                             "${sc.emoji} ${sc.label}" + if (s.sceneAuto && sc != Scene.STANDARD) " · optimisé" else "",
                             color = if (s.sceneAuto && sc != Scene.STANDARD) Accent else Color.White,
@@ -293,132 +344,210 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
+                    if (ctrl.locked) Text(
+                        "🔒 AE/AF verrouillé", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 4.dp).clip(RoundedCornerShape(12.dp)).background(Color(0x99000000))
+                            .clickable { ctrl.resetFocus() }.padding(horizontal = 10.dp, vertical = 5.dp)
+                    )
                 }
+                val hist = ctrl.histogram
+                if (s.histogram && hist != null) Histogram(hist)
             }
-            if (ctrl.recording) {
-                val t = ctrl.recSeconds
-                Text(
-                    "● %02d:%02d".format(t / 60, t % 60), color = Color.White, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp)
-                        .background(Color(0xFFE53935), RoundedCornerShape(12.dp)).padding(horizontal = 12.dp, vertical = 4.dp)
-                )
-            }
-            if (ctrl.countdown > 0) {
-                Text("${ctrl.countdown}", color = Color.White, fontSize = 96.sp, fontWeight = FontWeight.Bold)
-            }
-            val m = ctrl.message
-            if (m != null) {
-                Text(
-                    m, color = Color.White, fontSize = 14.sp,
-                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp)
-                        .background(Color(0xCC000000), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 8.dp)
-                )
-            }
+        }
+
+        // ---------- Messages ----------
+        if (ctrl.recording) {
+            val t = ctrl.recSeconds
             Text(
-                "x${fmt1(s.zoom)}", color = Accent, fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
-                    .background(Color(0x99000000), RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
+                (if (ctrl.recPaused) "❚❚ " else "● ") + "%02d:%02d".format(t / 60, t % 60),
+                color = Color.White, fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.Center).offset(y = (-160).dp)
+                    .background(if (ctrl.recPaused) Color(0xCC555555) else Color(0xFFE53935), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+            )
+        }
+        if (ctrl.countdown > 0) {
+            Text("${ctrl.countdown}", color = Color.White, fontSize = 110.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Center))
+        }
+        val m = ctrl.message
+        if (m != null) {
+            Text(
+                m, color = Color.White, fontSize = 14.sp,
+                modifier = Modifier.align(Alignment.Center).offset(y = (-110).dp)
+                    .background(Color(0xCC000000), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 8.dp)
             )
         }
 
-        // ---------- Objectifs ----------
-        if (ctrl.lenses.size > 1) Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)
+        // ---------- Commandes du bas ----------
+        Column(
+            Modifier.fillMaxWidth().align(Alignment.BottomCenter)
+                .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000), Color(0xEE000000))))
+                .navigationBarsPadding().padding(top = 24.dp)
         ) {
-            ctrl.lenses.forEach { l -> Chip(l.chip, caps?.id == l.id) { ctrl.selectLens(l.id) } }
-        }
-
-        // ---------- Mode Auto / Pro ----------
-        Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.Center) {
-            ModeTab("AUTO", !s.pro && !s.video) {
-                if (!ctrl.recording) { ctrl.update(s.copy(pro = false, video = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
-            }
-            Spacer(Modifier.width(18.dp))
-            ModeTab("PRO", s.pro && !s.video) {
-                if (ctrl.recording) Unit
-                else if (caps?.manualSensor == true) { ctrl.update(s.copy(pro = true, video = false)); param = Param.ISO }
-                else ctrl.message = "Réglages manuels ISO/vitesse non pris en charge par cette caméra"
-            }
-            Spacer(Modifier.width(18.dp))
-            ModeTab("VIDÉO", s.video) {
-                if (!ctrl.recording) { ctrl.update(s.copy(video = true, pro = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
-            }
-        }
-
-        // ---------- Choix du réglage ----------
-        val params = Param.entries.filter {
-            when (it) {
-                Param.EV -> !s.pro || s.video
-                Param.ISO, Param.SPEED -> s.pro && !s.video
-                Param.FOCUS -> (caps?.minFocus ?: 0f) > 0f
-                Param.FX -> (caps?.effects?.size ?: 0) > 1
-                else -> true
-            }
-        }
-        if (param !in params) param = params.first()
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            params.forEach { p -> Chip(p.label, p == param) { param = p } }
-        }
-
-        // ---------- Panneau du réglage ----------
-        Box(Modifier.fillMaxWidth().height(92.dp).padding(horizontal = 12.dp)) {
-            if (caps != null) ParamPanel(param, ctrl, s, caps)
-        }
-
-        // ---------- Déclencheur ----------
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            val thumb = ctrl.lastThumb
-            Box(
-                Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)).background(Panel)
-                    .border(1.dp, Color(0x55FFFFFF), RoundedCornerShape(12.dp))
-                    .clickable {
-                        val uri = ctrl.lastUri
-                        if (uri != null) {
-                            try {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW).setDataAndType(uri, if (ctrl.lastIsVideo) "video/mp4" else "image/jpeg")
-                                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                                )
-                            } catch (_: ActivityNotFoundException) { ctrl.message = "Aucune galerie trouvée" }
-                        }
-                    },
-                contentAlignment = Alignment.Center
+            if (qr != null) Row(
+                Modifier.padding(horizontal = 12.dp, vertical = 4.dp).fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp)).background(Color(0xEE16181D)).padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                if (thumb != null) Image(thumb.asImageBitmap(), "Dernière photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                else Text("🖼", fontSize = 22.sp)
+                Text("▦ QR  ", color = Accent, fontWeight = FontWeight.Bold)
+                Text(qr, color = Color.White, fontSize = 13.sp, maxLines = 2, modifier = Modifier.weight(1f))
+                if (ctrl.qrIsUrl) TextButton(onClick = {
+                    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(qr)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                    ctrl.qrText = null
+                }) { Text("Ouvrir") }
+                TextButton(onClick = {
+                    val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+                    cm?.setPrimaryClip(android.content.ClipData.newPlainText("QR", qr))
+                    ctrl.message = "Copié"; ctrl.qrText = null
+                }) { Text("Copier") }
             }
 
-            Box(
-                Modifier.size(78.dp).clip(CircleShape).border(4.dp, Color.White, CircleShape)
-                    .clickable { ctrl.shoot() },
-                contentAlignment = Alignment.Center
-            ) {
-                val red = Color(0xFFE53935)
-                if (s.video && ctrl.recording) Box(Modifier.size(30.dp).clip(RoundedCornerShape(6.dp)).background(red))
-                else Box(
-                    Modifier.fillMaxSize().padding(7.dp).clip(CircleShape)
-                        .background(if (ctrl.busy) Dim else if (s.video) red else if (s.pro) Accent else Color.White)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                Text(
+                    "x${fmt1(s.zoom)}", color = Accent, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.background(Color(0x99000000), RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
                 )
             }
 
-            Box(
-                Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable(enabled = !ctrl.recording) { ctrl.switchCamera() },
-                contentAlignment = Alignment.Center
+            // Objectifs
+            if (ctrl.lenses.size > 1) Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)
             ) {
-                Icon(Icons.Default.Refresh, contentDescription = "Changer de caméra", tint = Color.White)
+                ctrl.lenses.forEach { l -> Chip(l.chip, caps?.id == l.id) { ctrl.selectLens(l.id) } }
+            }
+
+            if (showPanel) {
+                val params = Param.entries.filter {
+                    when (it) {
+                        Param.EV -> !s.pro || s.video
+                        Param.ISO, Param.SPEED -> s.pro && !s.video
+                        Param.FOCUS -> (caps?.minFocus ?: 0f) > 0f
+                        Param.FX -> (caps?.effects?.size ?: 0) > 1
+                        else -> true
+                    }
+                }
+                if (param !in params) param = params.first()
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    params.forEach { p -> Chip(p.label, p == param) { param = p } }
+                }
+                Box(Modifier.fillMaxWidth().height(88.dp).padding(horizontal = 12.dp)) {
+                    if (caps != null) ParamPanel(param, ctrl, s, caps)
+                }
+            }
+
+            // Modes
+            Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                ModeTab("AUTO", !s.pro && !s.video) {
+                    if (!ctrl.recording) { ctrl.update(s.copy(pro = false, video = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
+                }
+                Spacer(Modifier.width(14.dp))
+                ModeTab("PRO", s.pro && !s.video) {
+                    if (ctrl.recording) Unit
+                    else if (caps?.manualSensor == true) { ctrl.update(s.copy(pro = true, video = false)); param = Param.ISO }
+                    else ctrl.message = "Réglages manuels ISO/vitesse non pris en charge par cette caméra"
+                }
+                Spacer(Modifier.width(14.dp))
+                ModeTab("VIDÉO", s.video) {
+                    if (!ctrl.recording) { ctrl.update(s.copy(video = true, pro = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
+                }
+                Spacer(Modifier.width(14.dp))
+                Text(
+                    if (showPanel) "▾ Réglages" else "▴ Réglages", color = Dim, fontSize = 13.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { showPanel = !showPanel }.padding(6.dp)
+                )
+            }
+
+            // Déclencheur
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (ctrl.recording) {
+                    RoundButton(if (ctrl.recPaused) "▶" else "❚❚") { ctrl.togglePause() }
+                } else {
+                    val thumb = ctrl.lastThumb
+                    Box(
+                        Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)).background(Panel)
+                            .border(1.dp, Color(0x55FFFFFF), RoundedCornerShape(12.dp))
+                            .clickable {
+                                val uri = ctrl.lastUri
+                                if (uri != null) {
+                                    try {
+                                        context.startActivity(
+                                            Intent(Intent.ACTION_VIEW).setDataAndType(uri, if (ctrl.lastIsVideo) "video/mp4" else "image/jpeg")
+                                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        )
+                                    } catch (_: ActivityNotFoundException) { ctrl.message = "Aucune galerie trouvée" }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (thumb != null) Image(thumb.asImageBitmap(), "Dernière photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        else Text("🖼", fontSize = 22.sp)
+                    }
+                }
+
+                Box(
+                    Modifier.size(80.dp).clip(CircleShape).border(4.dp, Color.White, CircleShape)
+                        .pointerInput(s.video) {
+                            detectTapGestures(
+                                onPress = { tryAwaitRelease(); ctrl.stopBurst() },
+                                onLongPress = { if (!s.video) ctrl.startBurst() },
+                                onTap = { ctrl.shoot() }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    val red = Color(0xFFE53935)
+                    if (s.video && ctrl.recording) Box(Modifier.size(30.dp).clip(RoundedCornerShape(6.dp)).background(red))
+                    else Box(
+                        Modifier.fillMaxSize().padding(7.dp).clip(CircleShape)
+                            .background(if (ctrl.busy) Dim else if (s.video) red else if (s.pro) Accent else Color.White),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (ctrl.burstCount > 0 && ctrl.busy && !s.video) Text("${ctrl.burstCount}", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+                    }
+                }
+
+                if (ctrl.recording) {
+                    RoundButton("📸") { textureRef?.let { tv -> runCatching { tv.bitmap }.getOrNull()?.let { ctrl.saveSnapshot(it) } } }
+                } else Box(
+                    Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable { ctrl.switchCamera() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Changer de caméra", tint = Color.White)
+                }
             }
         }
     }
 
     if (showSettings) SettingsDialog(ctrl, caps) { showSettings = false }
+}
+
+@Composable
+private fun RoundButton(text: String, onClick: () -> Unit) {
+    Box(
+        Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) { Text(text, color = Color.White, fontSize = 20.sp) }
+}
+
+@Composable
+private fun Histogram(bins: FloatArray) {
+    Canvas(
+        Modifier.size(width = 112.dp, height = 56.dp).clip(RoundedCornerShape(8.dp)).background(Color(0x88000000))
+    ) {
+        val bw = size.width / bins.size
+        bins.forEachIndexed { i, v ->
+            val h = v * size.height
+            drawRect(Color(0xCCFFFFFF), topLeft = Offset(i * bw, size.height - h), size = androidx.compose.ui.geometry.Size(bw, h))
+        }
+    }
 }
 
 @Composable
@@ -450,8 +579,15 @@ private fun Overlay(ctrl: CameraController) {
             drawLine(Color(0x55FFFFFF), Offset(cx - len * 1.3f, cy), Offset(cx - len * 1.1f, cy), 3f)
             drawLine(Color(0x55FFFFFF), Offset(cx + len * 1.1f, cy), Offset(cx + len * 1.3f, cy), 3f)
         }
+        if (s.faces) ctrl.faces.forEach { f ->
+            drawRoundRect(
+                Color(0xFFFFFFFF), topLeft = Offset(f.left * w, f.top * h),
+                size = androidx.compose.ui.geometry.Size((f.right - f.left) * w, (f.bottom - f.top) * h),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(16f), style = Stroke(3f)
+            )
+        }
         if (fp != null) {
-            drawCircle(Accent, radius = 46f, center = Offset(fp.first * w, fp.second * h), style = Stroke(4f))
+            drawCircle(if (ctrl.locked) Color(0xFFFF9800) else Accent, radius = 46f, center = Offset(fp.first * w, fp.second * h), style = Stroke(4f))
         }
         if (flashAlpha.value > 0f) drawRect(Color.White.copy(alpha = flashAlpha.value))
     }
@@ -629,13 +765,17 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
                     color = Dim, fontSize = 12.sp
                 )
                 Spacer(Modifier.height(8.dp))
+                SwitchRow("Aperçu plein écran", s.fillPreview) { ctrl.update(s.copy(fillPreview = it)) }
+                if ((caps?.faceMode ?: 0) != 0) SwitchRow("Détection des visages", s.faces) { ctrl.update(s.copy(faces = it)) }
+                SwitchRow("Lecteur de QR codes", s.qr) { ctrl.update(s.copy(qr = it)) }
+                SwitchRow("Histogramme", s.histogram) { ctrl.update(s.copy(histogram = it)) }
                 SwitchRow("Grille (règle des tiers)", s.grid) { ctrl.update(s.copy(grid = it)) }
                 SwitchRow("Niveau / horizon", s.level) { ctrl.update(s.copy(level = it)) }
                 if (caps?.ois == true || caps?.videoStab == true) SwitchRow("Stabilisation", s.stabilization) { ctrl.update(s.copy(stabilization = it)) }
                 SwitchRow("Son du déclencheur", s.sound) { ctrl.update(s.copy(sound = it)) }
                 SwitchRow("Boutons volume = déclencher", s.volumeShutter) { ctrl.update(s.copy(volumeShutter = it)) }
                 Spacer(Modifier.height(8.dp))
-                Text("Astuces : touchez l'image pour faire la mise au point, appui long pour revenir en auto, double-touche pour changer de caméra, pincez pour zoomer.", color = Dim, fontSize = 12.sp)
+                Text("Astuces : touchez l'image pour faire la mise au point, appui long pour verrouiller expo + mise au point, double-touche pour changer de caméra, pincez pour zoomer. Appui long sur le déclencheur = rafale (30 photos max). En vidéo : pause ❚❚ et photo 📸 pendant l'enregistrement.", color = Dim, fontSize = 12.sp)
                 Spacer(Modifier.height(10.dp))
                 OutlinedButton(onClick = {
                     ctrl.resetFocus()

@@ -1,6 +1,8 @@
 package com.vonmi.photopro
 
 import android.graphics.Bitmap
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
@@ -11,17 +13,41 @@ class SceneAnalyzer {
     private val labeler = ImageLabeling.getClient(
         ImageLabelerOptions.Builder().setConfidenceThreshold(0.55f).build()
     )
-    @Volatile private var running = false
+    private val scanner = BarcodeScanning.getClient()
+    @Volatile private var running = 0
 
-    fun analyze(bmp: Bitmap, onResult: (List<Pair<String, Float>>) -> Unit) {
-        if (running) return
-        running = true
-        labeler.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { labels -> onResult(labels.map { it.text to it.confidence }) }
-            .addOnCompleteListener { running = false }
+    fun analyze(
+        bmp: Bitmap, labels: Boolean, barcodes: Boolean,
+        onLabels: (List<Pair<String, Float>>) -> Unit,
+        onBarcode: (String?, Boolean) -> Unit,
+    ) {
+        if (running > 0) return
+        val img = InputImage.fromBitmap(bmp, 0)
+        if (labels) {
+            running++
+            labeler.process(img)
+                .addOnSuccessListener { l -> onLabels(l.map { it.text to it.confidence }) }
+                .addOnCompleteListener { running-- }
+        }
+        if (barcodes) {
+            running++
+            scanner.process(img)
+                .addOnSuccessListener { list ->
+                    val b = list.firstOrNull { !it.rawValue.isNullOrBlank() }
+                    if (b != null) {
+                        val text = when (b.valueType) {
+                            Barcode.TYPE_WIFI -> "Wi-Fi « ${b.wifi?.ssid} » — mot de passe : ${b.wifi?.password}"
+                            Barcode.TYPE_URL -> b.url?.url ?: b.rawValue
+                            else -> b.displayValue ?: b.rawValue
+                        }
+                        onBarcode(text, b.valueType == Barcode.TYPE_URL)
+                    }
+                }
+                .addOnCompleteListener { running-- }
+        }
     }
 
-    fun close() = labeler.close()
+    fun close() { labeler.close(); scanner.close() }
 
     companion object {
         private val fr = mapOf(

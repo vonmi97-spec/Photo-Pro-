@@ -23,3 +23,13 @@ Onglet **Actions** → dernière exécution « Build APK » → artefact **Appar
 - **Analyse de scène IA** (ML Kit, hors ligne) : nuit, portrait, paysage, nourriture, écran, document, animal, sport… avec optimisation automatique
 - **Objectifs** : barre de choix (ultra grand-angle, principal, télé, macro, avant), détection des objectifs cachés, fiche technique
 - **Appli par défaut** : répond aux demandes de photo/vidéo des autres applis et à « Ouvrir avec » pour les vidéos et liens
+
+## Nouveautés 2.1
+- Caméra **plein écran** (photo et vidéo), commandes en surimpression, bouton ⛶ Plein / ▭ Cadre, affichage 120 Hz
+- **Rafale** (appui long sur le déclencheur, 30 photos max)
+- **Verrouillage AE/AF** (appui long sur l'image)
+- **Détection des visages** (cadres + priorité visage)
+- **Lecteur de QR codes** (liens, Wi-Fi, texte) avec Ouvrir / Copier
+- **Histogramme** en direct
+- Vidéo : **pause / reprise** et **photo pendant l'enregistrement**
+- Retardateur 2 / 5 / 10 s, panneau de réglages repliable
