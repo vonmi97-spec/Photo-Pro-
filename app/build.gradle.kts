@@ -15,7 +15,22 @@ android {
         versionCode = 4
         versionName = "2.1"
     }
-    buildTypes { release { isMinifyEnabled = false } }
+    // Signature fixe : la clé vient des secrets GitHub (jamais stockée dans le dépôt)
+    val ksFile = file("release.jks")
+    val ksPass = System.getenv("KEYSTORE_PASSWORD")
+    val fixed = ksFile.exists() && !ksPass.isNullOrEmpty()
+    signingConfigs {
+        if (fixed) create("fixe") {
+            storeFile = ksFile
+            storePassword = ksPass
+            keyAlias = "photopro"
+            keyPassword = ksPass
+        }
+    }
+    buildTypes {
+        debug { if (fixed) signingConfig = signingConfigs.getByName("fixe") }
+        release { isMinifyEnabled = false; if (fixed) signingConfig = signingConfigs.getByName("fixe") }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
