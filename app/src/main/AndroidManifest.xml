@@ -44,7 +44,7 @@
             android:icon="@mipmap/ic_launcher"
             android:taskAffinity="com.vonmi.photopro.lecteur"
             android:label="Lecteur Photo Pro"
-            android:screenOrientation="portrait"
+            android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />

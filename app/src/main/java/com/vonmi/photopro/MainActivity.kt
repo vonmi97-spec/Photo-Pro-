@@ -21,6 +21,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -70,6 +71,19 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 private val Accent = Color(0xFFFFC83D)
+/** Angle (degrés) à appliquer aux boutons pour qu'ils restent lisibles quand le téléphone tourne. */
+private val LocalUiRotation = compositionLocalOf { 0f }
+
+@Composable
+private fun rememberUiRotation(deviceRot: Int): Float {
+    var target by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(deviceRot) {
+        val want = -deviceRot.toFloat()
+        val d = (((want - target) % 360f) + 540f) % 360f - 180f
+        target += d
+    }
+    return animateFloatAsState(target, tween(280), label = "rot").value
+}
 private val Panel = Color(0xFF16181D)
 private val Dim = Color(0xFF9AA0AA)
 
@@ -244,6 +258,8 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
     val qr = ctrl.qrText
     LaunchedEffect(qr) { if (qr != null) { delay(8000); ctrl.qrText = null } }
 
+    val uiRot = rememberUiRotation(ctrl.deviceRotation)
+    CompositionLocalProvider(LocalUiRotation provides uiRot) {
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
         // ---------- Aperçu plein écran ----------
         val ratio = caps?.let { it.previewSize.height.toFloat() / it.previewSize.width } ?: 0.75f
@@ -314,7 +330,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                 TopButton(if (fill) "⛶ Plein" else "▭ Cadre", active = false) { ctrl.update(s.copy(fillPreview = !fill)) }
                 TopButton("▶", active = false, enabled = !ctrl.recording) { onOpenPlayer() }
                 IconButton(onClick = { showSettings = true }) {
-                    Icon(Icons.Default.Settings, contentDescription = "Réglages", tint = Color.White)
+                    Icon(Icons.Default.Settings, contentDescription = "Réglages", tint = Color.White, modifier = Modifier.rotate(uiRot))
                 }
             }
             val info = buildString {
@@ -371,13 +387,13 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
             )
         }
         if (ctrl.countdown > 0) {
-            Text("${ctrl.countdown}", color = Color.White, fontSize = 110.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Center))
+            Text("${ctrl.countdown}", color = Color.White, fontSize = 110.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Center).rotate(uiRot))
         }
         val m = ctrl.message
         if (m != null) {
             Text(
                 m, color = Color.White, fontSize = 14.sp,
-                modifier = Modifier.align(Alignment.Center).offset(y = (-110).dp)
+                modifier = Modifier.align(Alignment.Center).offset(y = (-110).dp).rotate(uiRot)
                     .background(Color(0xCC000000), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 8.dp)
             )
         }
@@ -424,7 +440,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
                 Text(
                     "x${fmt1(s.zoom)}", color = Accent, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.background(Color(0x99000000), RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
+                    modifier = Modifier.rotate(uiRot).background(Color(0x99000000), RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
                 )
             }
 
@@ -491,7 +507,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                 } else {
                     val thumb = ctrl.lastThumb
                     Box(
-                        Modifier.size(54.dp).clip(RoundedCornerShape(12.dp)).background(Panel)
+                        Modifier.size(54.dp).rotate(uiRot).clip(RoundedCornerShape(12.dp)).background(Panel)
                             .border(1.dp, Color(0x55FFFFFF), RoundedCornerShape(12.dp))
                             .clickable {
                                 val uri = ctrl.lastUri
@@ -539,12 +555,13 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                     Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable { ctrl.switchCamera() },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Changer de caméra", tint = Color.White)
+                    Icon(Icons.Default.Refresh, contentDescription = "Changer de caméra", tint = Color.White, modifier = Modifier.rotate(uiRot))
                 }
             }
         }
     }
 
+    }
     if (showSettings) SettingsDialog(ctrl, caps) { showSettings = false }
 }
 
@@ -553,7 +570,7 @@ private fun RoundButton(text: String, onClick: () -> Unit) {
     Box(
         Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable(onClick = onClick),
         contentAlignment = Alignment.Center
-    ) { Text(text, color = Color.White, fontSize = 20.sp) }
+    ) { Text(text, color = Color.White, fontSize = 20.sp, modifier = Modifier.rotate(LocalUiRotation.current)) }
 }
 
 @Composable
@@ -874,7 +891,7 @@ private fun TopButton(text: String, enabled: Boolean = true, active: Boolean, on
         text, maxLines = 1,
         color = when { !enabled -> Color(0x55FFFFFF); active -> Accent; else -> Color.White },
         fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(Panel)
+        modifier = Modifier.rotate(LocalUiRotation.current).clip(RoundedCornerShape(14.dp)).background(Panel)
             .clickable(enabled = enabled, onClick = onClick).padding(horizontal = 10.dp, vertical = 7.dp)
     )
 }

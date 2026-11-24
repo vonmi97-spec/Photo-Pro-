@@ -253,8 +253,9 @@ private fun VideoPlayer(uri: Uri, onClose: () -> Unit) {
     var speed by remember { mutableFloatStateOf(1f) }
     BackHandler { onClose() }
     DisposableEffect(Unit) {
+        val prev = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-        onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT }
+        onDispose { activity?.requestedOrientation = prev }
     }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
@@ -311,6 +312,7 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
     var custom by remember { mutableStateOf<View?>(null) }
     var customCb by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
     var progress by remember { mutableIntStateOf(0) }
+    val baseOrientation = remember { activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
 
     val web = remember {
         WebView(ctx).apply {
@@ -348,7 +350,7 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
                 }
                 override fun onHideCustomView() {
                     custom = null; customCb = null
-                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    activity?.requestedOrientation = baseOrientation
                 }
             }
             loadUrl(youTubeWebUrl(startUrl) ?: startUrl)
@@ -365,7 +367,7 @@ private fun YouTubeTab(startUrl: String, onExit: () -> Unit) {
             web.stopLoading()
             web.onPause()
             web.destroy()
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            activity?.requestedOrientation = baseOrientation
         }
     }
     BackHandler {

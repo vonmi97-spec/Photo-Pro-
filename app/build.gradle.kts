@@ -12,8 +12,8 @@ android {
         applicationId = "com.vonmi.photopro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "2.3"
+        versionCode = 9
+        versionName = "2.4"
     }
     // Signature fixe : la clé vient des secrets GitHub (jamais stockée dans le dépôt)
     val ksFile = file("release.jks")
