@@ -366,10 +366,10 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
             val b = pano ?: return@LaunchedEffect
             pano = null
             delay(300)
-            ctrl.setProcessing("Assemblage du panorama…")
+            ctrl.processing = "Assemblage du panorama…"
             val res = withContext(Dispatchers.Default) { runCatching { b.build() }.getOrNull() }
             b.recycle()
-            ctrl.setProcessing(null)
+            ctrl.processing = null
             if (res != null) ctrl.saveBitmap(res, "Panorama enregistré") else ctrl.message = "Panorama trop court : tournez plus loin vers la droite"
         }
     }

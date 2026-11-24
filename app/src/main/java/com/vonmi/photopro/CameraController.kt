@@ -991,7 +991,7 @@ class CameraController(private val ctx: Context) {
     // Multi-images : Nuit et HDR
 
     @Volatile private var frameSink: ((ByteArray) -> Unit)? = null
-    var processing by mutableStateOf<String?>(null); private set
+    var processing by mutableStateOf<String?>(null)
     private val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     private fun multiShot(night: Boolean) {
@@ -1091,7 +1091,6 @@ class CameraController(private val ctx: Context) {
         }
     }
 
-    fun setProcessing(text: String?) { processing = text }
 
     /** Démarrer / terminer le panorama (géré par l'écran, qui lit les images de l'aperçu). */
     var onPanoToggle: (() -> Unit)? = null
