@@ -21,8 +21,14 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > app/release.jks
-            echo "Signature fixe activée"
+            printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n\t"' > /tmp/ks.b64
+            echo "Longueur du secret : $(wc -c < /tmp/ks.b64) caractères (attendu : 3516)"
+            if base64 -d -i /tmp/ks.b64 > app/release.jks 2>/dev/null; then
+              echo "Signature fixe activée"
+            else
+              echo "::error::KEYSTORE_BASE64 illisible : longueur $(wc -c < /tmp/ks.b64) au lieu de 3516"
+              exit 1
+            fi
           else
             echo "::warning::Secret KEYSTORE_BASE64 absent : signature temporaire"
           fi
