@@ -16,3 +16,10 @@ Photos enregistrées dans **Images/PhotoPro**.
 
 ## Télécharger l'APK
 Onglet **Actions** → dernière exécution « Build APK » → artefact **Appareil-Photo-Pro-APK**.
+
+## Nouveautés 2.0
+- **Mode VIDÉO** : 720p / 1080p / 4K, 30 ou 60 i/s, son, stabilisation
+- **Lecteur** : vidéos du téléphone, fichiers, liens .mp4, et **YouTube** (plein écran, vitesse de lecture)
+- **Analyse de scène IA** (ML Kit, hors ligne) : nuit, portrait, paysage, nourriture, écran, document, animal, sport… avec optimisation automatique
+- **Objectifs** : barre de choix (ultra grand-angle, principal, télé, macro, avant), détection des objectifs cachés, fiche technique
+- **Appli par défaut** : répond aux demandes de photo/vidéo des autres applis et à « Ouvrir avec » pour les vidéos et liens

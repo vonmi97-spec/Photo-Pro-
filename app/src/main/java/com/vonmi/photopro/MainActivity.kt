@@ -8,6 +8,10 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraMetadata
 import android.os.Build
 import android.os.Bundle
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.MediaStore
+import android.provider.Settings
 import android.view.KeyEvent
 import android.view.TextureView
 import android.view.WindowManager
@@ -75,10 +79,37 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ctrl = CameraController(applicationContext)
         granted.value = hasCameraPermission()
+        handleCaptureIntent(intent)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Accent, surface = Panel)) {
                 Root(ctrl, granted)
             }
+        }
+    }
+
+    /** Une autre appli demande une photo ou une vidéo : on lui renvoie le résultat. */
+    private fun handleCaptureIntent(i: Intent?) {
+        val action = i?.action ?: return
+        val isPhoto = action == MediaStore.ACTION_IMAGE_CAPTURE
+        val isVideo = action == MediaStore.ACTION_VIDEO_CAPTURE
+        if (action == MediaStore.INTENT_ACTION_VIDEO_CAMERA) { ctrl.update(ctrl.settings.copy(video = true, pro = false)); return }
+        if (action == MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA) { if (ctrl.settings.video) ctrl.update(ctrl.settings.copy(video = false)); return }
+        if (!isPhoto && !isVideo) return
+        @Suppress("DEPRECATION")
+        val out = i.getParcelableExtra<Uri>(MediaStore.EXTRA_OUTPUT) ?: i.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+        ctrl.externalOutput = out
+        ctrl.update(ctrl.settings.copy(video = isVideo, pro = false, timer = 0))
+        ctrl.externalRequest = { uri, bytes ->
+            val data = Intent()
+            if (uri != null) {
+                data.data = uri
+                data.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } else if (bytes != null) {
+                val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.let { data.putExtra("data", it) }
+            }
+            setResult(RESULT_OK, data)
+            finish()
         }
     }
 
@@ -106,13 +137,15 @@ private fun Root(ctrl: CameraController, granted: MutableState<Boolean>) {
         granted.value = res[Manifest.permission.CAMERA] == true
     }
     val perms = remember {
-        if (Build.VERSION.SDK_INT < 29) arrayOf(Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        else arrayOf(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT < 29) arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        else arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
     }
     LaunchedEffect(Unit) { if (!granted.value) launcher.launch(perms) }
 
+    var player by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize().background(Color.Black).systemBarsPadding()) {
-        if (granted.value) CameraScreen(ctrl)
+        if (player) PlayerScreen(onClose = { player = false })
+        else if (granted.value) CameraScreen(ctrl, onOpenPlayer = { player = true })
         else Column(
             Modifier.fillMaxSize().padding(32.dp),
             verticalArrangement = Arrangement.Center,
@@ -134,12 +167,27 @@ private enum class Param(val label: String) {
 }
 
 @Composable
-private fun CameraScreen(ctrl: CameraController) {
+private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
     val s = ctrl.settings
     val caps = ctrl.caps
     val context = androidx.compose.ui.platform.LocalContext.current
     var param by remember { mutableStateOf(Param.ZOOM) }
     var showSettings by remember { mutableStateOf(false) }
+
+    var textureRef by remember { mutableStateOf<TextureView?>(null) }
+    val analyzer = remember { SceneAnalyzer() }
+    DisposableEffect(Unit) { onDispose { analyzer.close() } }
+    LaunchedEffect(s.sceneAnalysis, s.pro, textureRef) {
+        val tv = textureRef ?: return@LaunchedEffect
+        if (!s.sceneAnalysis || s.pro) { ctrl.clearScene(); return@LaunchedEffect }
+        while (true) {
+            delay(1200)
+            if (!tv.isAvailable || tv.width == 0) continue
+            val h = (256f * tv.height / tv.width).roundToInt().coerceAtLeast(1)
+            val bmp = runCatching { tv.getBitmap(256, h) }.getOrNull() ?: continue
+            analyzer.analyze(bmp) { ctrl.onSceneLabels(it) }
+        }
+    }
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
@@ -162,12 +210,17 @@ private fun CameraScreen(ctrl: CameraController) {
                 val next = FlashMode.entries[(s.flash.ordinal + 1) % FlashMode.entries.size]
                 ctrl.update(s.copy(flash = next))
             }
-            TopButton(if (s.timer == 0) "⏱ Off" else "⏱ ${s.timer}s", active = s.timer > 0) {
+            TopButton(if (s.timer == 0) "⏱ Off" else "⏱ ${s.timer}s", enabled = !s.video, active = s.timer > 0) {
                 val next = when (s.timer) { 0 -> 3; 3 -> 10; else -> 0 }
                 ctrl.update(s.copy(timer = next))
             }
-            TopButton("# Grille", active = s.grid) { ctrl.update(s.copy(grid = !s.grid)) }
-            TopButton(if (s.wide) "16:9" else "4:3", active = false) { ctrl.update(s.copy(wide = !s.wide)) }
+            TopButton("#", active = s.grid) { ctrl.update(s.copy(grid = !s.grid)) }
+            if (s.video) TopButton(if (s.videoRes == 2160) "4K" else "${s.videoRes}p", active = false, enabled = !ctrl.recording) {
+                val opts = caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)
+                val i = opts.indexOf(s.videoRes)
+                ctrl.update(s.copy(videoRes = opts[(i + 1) % opts.size]))
+            } else TopButton(if (s.wide) "16:9" else "4:3", active = false) { ctrl.update(s.copy(wide = !s.wide)) }
+            TopButton("▶ Lecteur", active = false, enabled = !ctrl.recording) { onOpenPlayer() }
             IconButton(onClick = { showSettings = true }) {
                 Icon(Icons.Default.Settings, contentDescription = "Réglages", tint = Color.White)
             }
@@ -178,7 +231,8 @@ private fun CameraScreen(ctrl: CameraController) {
             if (caps != null) append(caps.label)
             if (caps?.aperture != null) append(" · f/${fmt1(caps.aperture)}")
             append("   ")
-            if (s.pro) append("ISO ${s.iso} · ${formatShutter(s.exposureNs)}")
+            if (s.video) append("${if (s.videoRes == 2160) "4K" else "${s.videoRes}p"} · ${if (s.fps60 && caps?.fps60 != null) 60 else 30} i/s")
+            else if (s.pro) append("ISO ${s.iso} · ${formatShutter(s.exposureNs)}")
             else if (ctrl.live.iso > 0) append("ISO ${ctrl.live.iso} · ${formatShutter(ctrl.live.expNs)}")
         }
         Text(info, color = Dim, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
@@ -206,7 +260,7 @@ private fun CameraScreen(ctrl: CameraController) {
             ) {
                 AndroidView(
                     factory = { c ->
-                        TextureView(c).apply {
+                        TextureView(c).also { textureRef = it }.apply {
                             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = ctrl.attachSurface(st)
                                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
@@ -218,6 +272,36 @@ private fun CameraScreen(ctrl: CameraController) {
                     modifier = Modifier.fillMaxSize()
                 )
                 Overlay(ctrl)
+                if (s.sceneAnalysis && !s.pro) {
+                    val sc = ctrl.scene
+                    Column(Modifier.align(Alignment.TopStart).padding(8.dp)) {
+                        Text(
+                            "${sc.emoji} ${sc.label}" + if (s.sceneAuto && sc != Scene.STANDARD) " · optimisé" else "",
+                            color = if (s.sceneAuto && sc != Scene.STANDARD) Accent else Color.White,
+                            fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(Color(0x99000000))
+                                .clickable {
+                                    ctrl.update(s.copy(sceneAuto = !s.sceneAuto))
+                                    ctrl.message = if (!s.sceneAuto) "Optimisation automatique activée" else "Optimisation automatique désactivée"
+                                }
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                        if (ctrl.sceneLabels.isNotEmpty()) Text(
+                            ctrl.sceneLabels.joinToString(" · ") { (t, c) -> "${SceneAnalyzer.translate(t)} ${(c * 100).roundToInt()} %" },
+                            color = Color(0xCCFFFFFF), fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 4.dp).background(Color(0x66000000), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+            if (ctrl.recording) {
+                val t = ctrl.recSeconds
+                Text(
+                    "● %02d:%02d".format(t / 60, t % 60), color = Color.White, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp)
+                        .background(Color(0xFFE53935), RoundedCornerShape(12.dp)).padding(horizontal = 12.dp, vertical = 4.dp)
+                )
             }
             if (ctrl.countdown > 0) {
                 Text("${ctrl.countdown}", color = Color.White, fontSize = 96.sp, fontWeight = FontWeight.Bold)
@@ -237,21 +321,36 @@ private fun CameraScreen(ctrl: CameraController) {
             )
         }
 
+        // ---------- Objectifs ----------
+        if (ctrl.lenses.size > 1) Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)
+        ) {
+            ctrl.lenses.forEach { l -> Chip(l.chip, caps?.id == l.id) { ctrl.selectLens(l.id) } }
+        }
+
         // ---------- Mode Auto / Pro ----------
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.Center) {
-            ModeTab("AUTO", !s.pro) { ctrl.update(s.copy(pro = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
-            Spacer(Modifier.width(24.dp))
-            ModeTab("PRO", s.pro) {
-                if (caps?.manualSensor == true) { ctrl.update(s.copy(pro = true)); param = Param.ISO }
+            ModeTab("AUTO", !s.pro && !s.video) {
+                if (!ctrl.recording) { ctrl.update(s.copy(pro = false, video = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
+            }
+            Spacer(Modifier.width(18.dp))
+            ModeTab("PRO", s.pro && !s.video) {
+                if (ctrl.recording) Unit
+                else if (caps?.manualSensor == true) { ctrl.update(s.copy(pro = true, video = false)); param = Param.ISO }
                 else ctrl.message = "Réglages manuels ISO/vitesse non pris en charge par cette caméra"
+            }
+            Spacer(Modifier.width(18.dp))
+            ModeTab("VIDÉO", s.video) {
+                if (!ctrl.recording) { ctrl.update(s.copy(video = true, pro = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
             }
         }
 
         // ---------- Choix du réglage ----------
         val params = Param.entries.filter {
             when (it) {
-                Param.EV -> !s.pro
-                Param.ISO, Param.SPEED -> s.pro
+                Param.EV -> !s.pro || s.video
+                Param.ISO, Param.SPEED -> s.pro && !s.video
                 Param.FOCUS -> (caps?.minFocus ?: 0f) > 0f
                 Param.FX -> (caps?.effects?.size ?: 0) > 1
                 else -> true
@@ -285,7 +384,7 @@ private fun CameraScreen(ctrl: CameraController) {
                         if (uri != null) {
                             try {
                                 context.startActivity(
-                                    Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg")
+                                    Intent(Intent.ACTION_VIEW).setDataAndType(uri, if (ctrl.lastIsVideo) "video/mp4" else "image/jpeg")
                                         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
                                 )
                             } catch (_: ActivityNotFoundException) { ctrl.message = "Aucune galerie trouvée" }
@@ -298,13 +397,20 @@ private fun CameraScreen(ctrl: CameraController) {
             }
 
             Box(
-                Modifier.size(78.dp).clip(CircleShape).border(4.dp, Color.White, CircleShape).padding(7.dp)
-                    .clip(CircleShape).background(if (ctrl.busy) Dim else if (s.pro) Accent else Color.White)
-                    .clickable { ctrl.shoot() }
-            )
+                Modifier.size(78.dp).clip(CircleShape).border(4.dp, Color.White, CircleShape)
+                    .clickable { ctrl.shoot() },
+                contentAlignment = Alignment.Center
+            ) {
+                val red = Color(0xFFE53935)
+                if (s.video && ctrl.recording) Box(Modifier.size(30.dp).clip(RoundedCornerShape(6.dp)).background(red))
+                else Box(
+                    Modifier.fillMaxSize().padding(7.dp).clip(CircleShape)
+                        .background(if (ctrl.busy) Dim else if (s.video) red else if (s.pro) Accent else Color.White)
+                )
+            }
 
             Box(
-                Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable { ctrl.switchCamera() },
+                Modifier.size(54.dp).clip(CircleShape).background(Panel).clickable(enabled = !ctrl.recording) { ctrl.switchCamera() },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(Icons.Default.Refresh, contentDescription = "Changer de caméra", tint = Color.White)
@@ -469,10 +575,63 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
                     "Photo : ${caps.jpegSize.width}×${caps.jpegSize.height} (${"%.1f".format(Locale.FRANCE, caps.jpegSize.width * caps.jpegSize.height / 1e6)} Mpx)",
                     color = Dim, fontSize = 12.sp
                 )
+                Spacer(Modifier.height(10.dp))
+                Text("Vidéo", color = Dim, fontSize = 13.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(vertical = 6.dp)) {
+                    (caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)).forEach { h ->
+                        Chip(if (h == 2160) "4K" else "${h}p", s.videoRes == h) { ctrl.update(s.copy(videoRes = h)) }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(bottom = 6.dp)) {
+                    Chip("30 i/s", !s.fps60) { ctrl.update(s.copy(fps60 = false)) }
+                    if (caps?.fps60 != null) Chip("60 i/s", s.fps60) { ctrl.update(s.copy(fps60 = true)) }
+                }
+                SwitchRow("Enregistrer le son", s.videoAudio) { ctrl.update(s.copy(videoAudio = it)) }
+                Spacer(Modifier.height(10.dp))
+                Text("Analyse de scène (IA)", color = Dim, fontSize = 13.sp)
+                SwitchRow("Reconnaître la scène", s.sceneAnalysis) { ctrl.update(s.copy(sceneAnalysis = it)) }
+                if (s.sceneAnalysis) SwitchRow("Optimiser automatiquement", s.sceneAuto) { ctrl.update(s.copy(sceneAuto = it)) }
+                Text(
+                    "Nuit, portrait, paysage, nourriture, écran, document, animal, sport, neige, plage, coucher de soleil… " +
+                        "L'analyse se fait sur le téléphone, sans internet. Désactivée en mode PRO.",
+                    color = Dim, fontSize = 12.sp
+                )
+                Spacer(Modifier.height(10.dp))
+                Text("Objectifs détectés", color = Dim, fontSize = 13.sp)
+                ctrl.lenses.forEach { l ->
+                    val parts = listOfNotNull(
+                        l.eqFocal?.let { "${it.roundToInt()} mm éq." },
+                        l.aperture?.let { "f/${fmt1(it)}" },
+                        if (l.megapixels > 0f) "${fmt1(l.megapixels)} Mpx" else null,
+                        if (l.minFocus > 0f) "AF" else "fixe",
+                        if (l.ois) "OIS" else null,
+                        if (l.manual) "manuel" else null,
+                        if (l.raw) "RAW" else null,
+                    )
+                    Text(
+                        "${l.chip} — ${l.kind}${if (l.hidden) " (caché)" else ""}\n" + parts.joinToString(" · "),
+                        fontSize = 12.sp, modifier = Modifier.padding(vertical = 3.dp)
+                    )
+                }
+                if (ctrl.lenses.count { !it.front } <= 1) Text(
+                    "Votre téléphone ne donne accès qu'à un objectif arrière aux applis tierces : utilisez le zoom.",
+                    color = Dim, fontSize = 12.sp
+                )
+                Spacer(Modifier.height(10.dp))
+                Text("Appli par défaut", color = Dim, fontSize = 13.sp)
+                val ctx = androidx.compose.ui.platform.LocalContext.current
+                OutlinedButton(onClick = {
+                    runCatching { ctx.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                        .onFailure { runCatching { ctx.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+                }) { Text("Ouvrir les applis par défaut") }
+                Text(
+                    "Photo Pro apparaît quand une appli demande une photo ou une vidéo, et dans « Ouvrir avec » pour les vidéos : choisissez-le puis « Toujours ».",
+                    color = Dim, fontSize = 12.sp
+                )
                 Spacer(Modifier.height(8.dp))
                 SwitchRow("Grille (règle des tiers)", s.grid) { ctrl.update(s.copy(grid = it)) }
                 SwitchRow("Niveau / horizon", s.level) { ctrl.update(s.copy(level = it)) }
-                if (caps?.ois == true) SwitchRow("Stabilisation optique", s.stabilization) { ctrl.update(s.copy(stabilization = it)) }
+                if (caps?.ois == true || caps?.videoStab == true) SwitchRow("Stabilisation", s.stabilization) { ctrl.update(s.copy(stabilization = it)) }
                 SwitchRow("Son du déclencheur", s.sound) { ctrl.update(s.copy(sound = it)) }
                 SwitchRow("Boutons volume = déclencher", s.volumeShutter) { ctrl.update(s.copy(volumeShutter = it)) }
                 Spacer(Modifier.height(8.dp))
@@ -480,7 +639,7 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
                 Spacer(Modifier.height(10.dp))
                 OutlinedButton(onClick = {
                     ctrl.resetFocus()
-                    ctrl.update(CamSettings(wide = s.wide))
+                    ctrl.update(CamSettings(wide = s.wide, video = s.video, videoRes = s.videoRes))
                 }) { Text("Réinitialiser les réglages photo") }
             }
         }
@@ -498,7 +657,7 @@ private fun SwitchRow(label: String, value: Boolean, onChange: (Boolean) -> Unit
 @Composable
 private fun TopButton(text: String, enabled: Boolean = true, active: Boolean, onClick: () -> Unit) {
     Text(
-        text,
+        text, maxLines = 1,
         color = when { !enabled -> Color(0x55FFFFFF); active -> Accent; else -> Color.White },
         fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
         modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(Panel)

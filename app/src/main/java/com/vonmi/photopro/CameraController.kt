@@ -1,6 +1,12 @@
 package com.vonmi.photopro
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.media.MediaMetadataRetriever
+import android.media.MediaRecorder
+import android.os.ParcelFileDescriptor
+import androidx.core.content.ContextCompat
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
@@ -67,6 +73,12 @@ data class CamSettings(
     val sound: Boolean = true,
     val volumeShutter: Boolean = true,
     val level: Boolean = true,
+    val video: Boolean = false,
+    val videoRes: Int = 1080,
+    val fps60: Boolean = false,
+    val videoAudio: Boolean = true,
+    val sceneAnalysis: Boolean = true,
+    val sceneAuto: Boolean = true,
 )
 
 data class CamCaps(
@@ -95,7 +107,51 @@ data class CamCaps(
     val previewSize: Size,
     val aperture: Float?,
     val focal: Float?,
+    val videoSize: Size,
+    val videoHeights: List<Int>,
+    val fps30: Range<Int>?,
+    val fps60: Range<Int>?,
+    val videoStab: Boolean,
+    val sceneModes: List<Int>,
 )
+
+data class LensInfo(
+    val id: String,
+    val front: Boolean,
+    val eqFocal: Float?,
+    val megapixels: Float,
+    val aperture: Float?,
+    val minFocus: Float,
+    val ois: Boolean,
+    val manual: Boolean,
+    val raw: Boolean,
+    val hidden: Boolean,
+    var factor: Float = 1f,
+    var kind: String = "Principal",
+) {
+    val chip: String get() = when {
+        front -> "🤳 Avant"
+        kind == "Macro" -> "🌸 Macro"
+        kind == "Profondeur" -> "Profondeur"
+        else -> "×" + (if (factor < 1f) "%.1f" else "%.0f").format(Locale.FRANCE, factor)
+    }
+}
+
+enum class Scene(val label: String, val emoji: String, val sceneMode: Int?) {
+    STANDARD("Standard", "📷", null),
+    NIGHT("Nuit", "🌙", CameraMetadata.CONTROL_SCENE_MODE_NIGHT),
+    PORTRAIT("Portrait", "👤", CameraMetadata.CONTROL_SCENE_MODE_PORTRAIT),
+    LANDSCAPE("Paysage", "🏞", CameraMetadata.CONTROL_SCENE_MODE_LANDSCAPE),
+    SUNSET("Coucher de soleil", "🌅", CameraMetadata.CONTROL_SCENE_MODE_SUNSET),
+    BEACH("Plage", "🏖", CameraMetadata.CONTROL_SCENE_MODE_BEACH),
+    SNOW("Neige", "❄", CameraMetadata.CONTROL_SCENE_MODE_SNOW),
+    FOOD("Nourriture", "🍽", null),
+    PET("Animal", "🐾", CameraMetadata.CONTROL_SCENE_MODE_ACTION),
+    FLOWER("Fleurs / plantes", "🌸", null),
+    SCREEN("Écran", "🖥", null),
+    DOCUMENT("Texte / document", "📄", null),
+    SPORT("Sport", "🏀", CameraMetadata.CONTROL_SCENE_MODE_SPORTS),
+}
 
 data class LiveInfo(val iso: Int = 0, val expNs: Long = 0, val focus: Float = 0f)
 
@@ -121,20 +177,31 @@ class CameraController(private val ctx: Context) {
     var deviceRotation by mutableStateOf(0); private set
     var rollDeg by mutableStateOf(0f); private set
     var busy by mutableStateOf(false); private set
+    var recording by mutableStateOf(false); private set
+    var recSeconds by mutableStateOf(0); private set
+    var lastIsVideo by mutableStateOf(false); private set
 
     @Volatile private var cfg: CamSettings = settings
     @Volatile private var cur: CamCaps? = null
     @Volatile private var tapRegion: MeteringRectangle? = null
 
-    val cameraIds: List<String> = runCatching {
-        manager.cameraIdList.filter { id ->
-            val c = manager.getCameraCharacteristics(id)
-            val cp = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
-            cp.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE)
-        }
-    }.getOrDefault(emptyList())
+    /** Objectifs déclarés + objectifs « cachés » trouvés en sondant les identifiants 0 à 9. */
+    val lenses: List<LensInfo> = detectLenses()
+    val cameraIds: List<String> = lenses.map { it.id }
 
-    private var index = 0
+    // ---- analyse de scène ----
+    var scene by mutableStateOf(Scene.STANDARD); private set
+    var sceneLabels by mutableStateOf<List<Pair<String, Float>>>(emptyList()); private set
+    @Volatile private var activeScene = Scene.STANDARD
+    private var candidate = Scene.STANDARD
+    private var candidateCount = 0
+
+    // ---- appel par une autre appli (appareil photo par défaut) ----
+    /** Non nul quand une autre appli a demandé une photo / vidéo : on lui renvoie le résultat. */
+    var externalRequest: ((Uri?, ByteArray?) -> Unit)? = null
+    var externalOutput: Uri? = null
+
+    private var index = lenses.indexOfFirst { !it.front && it.kind == "Principal" }.coerceAtLeast(0)
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
@@ -144,6 +211,17 @@ class CameraController(private val ctx: Context) {
     private var opening = false
     private var lastLive = 0L
     private var pendingOrientation = 0
+    private var recorder: MediaRecorder? = null
+    private var recPfd: ParcelFileDescriptor? = null
+    private var recUri: Uri? = null
+    private var recStartedAt = 0L
+    private val recTick = object : Runnable {
+        override fun run() {
+            if (!recording) return
+            recSeconds = ((SystemClock.elapsedRealtime() - recStartedAt) / 1000).toInt()
+            main.postDelayed(this, 500)
+        }
+    }
 
     private val orientationListener = object : OrientationEventListener(ctx) {
         override fun onOrientationChanged(o: Int) {
@@ -230,6 +308,7 @@ class CameraController(private val ctx: Context) {
     }
 
     private fun closeCamera() {
+        if (recorder != null) finishRecording()
         try { session?.close() } catch (_: Exception) {}
         session = null
         try { device?.close() } catch (_: Exception) {}
@@ -281,6 +360,73 @@ class CameraController(private val ctx: Context) {
     }
 
     // ------------------------------------------------------------------
+    // Objectifs
+
+    private fun detectLenses(): List<LensInfo> {
+        val listed = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
+        val probed = (0..9).map { it.toString() }.filter { id ->
+            id !in listed && runCatching { manager.getCameraCharacteristics(id) }.isSuccess
+        }
+        val out = (listed + probed).mapNotNull { id ->
+            runCatching {
+                val ch = manager.getCameraCharacteristics(id)
+                val cp = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+                if (!cp.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE)) return@runCatching null
+                val focal = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                val phys = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                val eq = if (focal != null && phys != null && phys.width > 0f) {
+                    focal * 43.27f / kotlin.math.sqrt(phys.width * phys.width + phys.height * phys.height)
+                } else null
+                val px = ch.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+                LensInfo(
+                    id = id,
+                    front = ch.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT,
+                    eqFocal = eq,
+                    megapixels = if (px != null) px.width * px.height / 1e6f else 0f,
+                    aperture = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull(),
+                    minFocus = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f,
+                    ois = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                        ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true,
+                    manual = cp.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR),
+                    raw = cp.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW),
+                    hidden = id !in listed,
+                )
+            }.getOrNull()
+        }
+        val main = out.firstOrNull { !it.front && !it.hidden } ?: out.firstOrNull { !it.front }
+        val mainEq = main?.eqFocal
+        out.forEach { l ->
+            val e = l.eqFocal
+            l.factor = if (e != null && mainEq != null && mainEq > 0f) e / mainEq else 1f
+            l.kind = when {
+                l.front -> "Avant"
+                l === main -> "Principal"
+                l.megapixels in 0.1f..5.5f && l.minFocus >= 15f -> "Macro"
+                l.megapixels in 0.1f..2.5f -> "Profondeur"
+                l.factor < 0.8f -> "Ultra grand-angle"
+                l.factor > 1.5f -> "Téléobjectif"
+                else -> "Principal"
+            }
+        }
+        // Objectifs arrière triés du plus large au plus serré, puis l'avant
+        return out.sortedBy { it.hidden }
+            .distinctBy { Triple(it.front, it.eqFocal?.roundToInt(), it.megapixels.roundToInt()) }
+            .sortedWith(compareBy<LensInfo> { it.front }.thenBy { it.factor })
+    }
+
+    fun selectLens(id: String) {
+        val i = cameraIds.indexOf(id)
+        if (i < 0 || i == index || recording) return
+        index = i
+        tapRegion = null
+        focusPoint = null
+        bg.post {
+            closeCamera()
+            if (resumed && texture != null) openCamera()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Capacités du capteur
 
     private fun buildCaps(id: String): CamCaps {
@@ -315,7 +461,7 @@ class CameraController(private val ctx: Context) {
         }
 
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-        val ratio = if (cfg.wide) 16f / 9f else 4f / 3f
+        val ratio = if (cfg.wide || cfg.video) 16f / 9f else 4f / 3f
         fun matches(s: Size) = abs(s.width.toFloat() / s.height - ratio) < 0.03f
         val jpegs = map.getOutputSizes(ImageFormat.JPEG) ?: arrayOf(Size(1920, 1080))
         val jpeg = jpegs.filter(::matches).maxByOrNull { it.width.toLong() * it.height }
@@ -325,11 +471,28 @@ class CameraController(private val ctx: Context) {
             .maxByOrNull { it.width.toLong() * it.height }
             ?: prevs.minBy { abs(it.width.toFloat() / it.height - ratio) }
 
-        val dir = if (front) "Avant" else "Arrière"
-        val lens = if (focal != null) " · ${"%.1f".format(Locale.FRANCE, focal)} mm" else ""
+        val vids = map.getOutputSizes(MediaRecorder::class.java) ?: arrayOf()
+        val wantW = when (cfg.videoRes) { 2160 -> 3840; 720 -> 1280; else -> 1920 }
+        val wantH = cfg.videoRes
+        val video = vids.firstOrNull { it.width == wantW && it.height == wantH }
+            ?: vids.filter { matches(it) && it.width <= 1920 }.maxByOrNull { it.width.toLong() * it.height }
+            ?: Size(1280, 720)
+        val heights = listOf(720 to 1280, 1080 to 1920, 2160 to 3840)
+            .filter { (h, w) -> vids.any { it.width == w && it.height == h } }.map { it.first }
+        val fpsRanges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: arrayOf()
+        val f30 = fpsRanges.filter { it.upper == 30 }.maxByOrNull { it.lower }
+        val f60 = fpsRanges.filter { it.upper == 60 }.maxByOrNull { it.lower }
+        val vstab = ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            ?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
+
+        val li = lenses.firstOrNull { it.id == id }
+        val dir = li?.kind ?: if (front) "Avant" else "Arrière"
+        val lens = li?.eqFocal?.let { " · ${it.roundToInt()} mm" } ?: ""
         return CamCaps(
             id, front, "$dir$lens", orient, manual, iso, exp, minFocus, awb, af, fx,
-            evR, evS, zMin, zMax, useRatio, flash, ois, active, maxAf, maxAe, jpeg, prev, aperture, focal
+            evR, evS, zMin, zMax, useRatio, flash, ois, active, maxAf, maxAe, jpeg, prev, aperture, focal,
+            video, heights, f30, f60, vstab,
+            ch.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)?.toList() ?: emptyList()
         )
     }
 
@@ -344,7 +507,7 @@ class CameraController(private val ctx: Context) {
                 effect = if (c.effects.contains(s.effect)) s.effect else CameraMetadata.CONTROL_EFFECT_MODE_OFF,
                 ev = s.ev.coerceIn(c.evRange.lower, c.evRange.upper),
                 zoom = 1f.coerceIn(c.zoomMin, c.zoomMax),
-                pro = s.pro && c.manualSensor,
+                pro = s.pro && c.manualSensor && !s.video,
                 manualFocus = s.manualFocus && c.minFocus > 0f,
                 flash = if (c.hasFlash) s.flash else FlashMode.OFF,
             ),
@@ -360,22 +523,23 @@ class CameraController(private val ctx: Context) {
         settings = newSettings
         cfg = newSettings
         saveSettings(newSettings)
-        if (old.wide != newSettings.wide) {
+        if (old.sceneAuto != newSettings.sceneAuto || old.sceneAnalysis != newSettings.sceneAnalysis) {
+            if (!newSettings.sceneAnalysis) { activeScene = Scene.STANDARD; scene = Scene.STANDARD }
+        }
+        if (old.wide != newSettings.wide || old.video != newSettings.video || old.videoRes != newSettings.videoRes) {
             bg.post { closeCamera(); if (resumed && texture != null) openCamera() }
             return
         }
         if (refresh) bg.post { updatePreview() }
     }
 
+    /** Bascule avant / arrière (objectif principal). */
     fun switchCamera() {
-        if (cameraIds.size < 2) return
-        index = (index + 1) % cameraIds.size
-        tapRegion = null
-        focusPoint = null
-        bg.post {
-            closeCamera()
-            if (resumed && texture != null) openCamera()
-        }
+        if (recording) return
+        val curFront = lenses.getOrNull(index)?.front == true
+        val target = lenses.firstOrNull { it.front != curFront && (it.front || it.kind == "Principal") }
+            ?: lenses.firstOrNull { it.front != curFront } ?: return
+        selectLens(target.id)
     }
 
     fun resetFocus() {
@@ -456,7 +620,7 @@ class CameraController(private val ctx: Context) {
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
 
         // Exposition
-        if (s.pro && c.manualSensor) {
+        if (s.pro && !s.video && c.manualSensor) {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
             var exp = s.exposureNs
             var iso = s.iso
@@ -487,7 +651,28 @@ class CameraController(private val ctx: Context) {
                 CaptureRequest.FLASH_MODE,
                 if (c.hasFlash && s.flash == FlashMode.TORCH) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF
             )
-            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, s.ev.coerceIn(c.evRange.lower, c.evRange.upper))
+            val sc = if (s.sceneAnalysis && s.sceneAuto) activeScene else Scene.STANDARD
+            val stepsPerEv = if (c.evStep > 0f) 1f / c.evStep else 1f
+            fun has(m: Int?) = m != null && c.sceneModes.contains(m)
+            val adj = when (sc) {
+                Scene.NIGHT -> if (has(sc.sceneMode)) 0f else 0.7f
+                Scene.FOOD, Scene.FLOWER, Scene.DOCUMENT -> 0.3f
+                Scene.SNOW, Scene.BEACH -> if (has(sc.sceneMode)) 0f else 0.7f
+                Scene.SCREEN -> -1f
+                Scene.SUNSET -> if (has(sc.sceneMode)) 0f else -0.3f
+                else -> 0f
+            }
+            b.set(
+                CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                (s.ev + (adj * stepsPerEv).roundToInt()).coerceIn(c.evRange.lower, c.evRange.upper)
+            )
+            val mode = sc.sceneMode
+            if (mode != null && mode in c.sceneModes && !s.video && !s.manualFocus && tapRegion == null &&
+                s.awb == CameraMetadata.CONTROL_AWB_MODE_AUTO && s.effect == CameraMetadata.CONTROL_EFFECT_MODE_OFF
+            ) {
+                b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
+                b.set(CaptureRequest.CONTROL_SCENE_MODE, mode)
+            }
         }
 
         // Mise au point
@@ -501,6 +686,8 @@ class CameraController(private val ctx: Context) {
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
                 if (c.maxAfRegions > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
             }
+            s.video && c.afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO) ->
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
             c.afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             c.afModes.contains(CameraMetadata.CONTROL_AF_MODE_AUTO) ->
@@ -534,6 +721,16 @@ class CameraController(private val ctx: Context) {
             )
         }
 
+        if (s.video) {
+            val fr = if (s.fps60 && c.fps60 != null) c.fps60 else c.fps30
+            if (fr != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fr)
+            if (c.videoStab) b.set(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                if (s.stabilization) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+            )
+        }
+
         if (capture) {
             b.set(CaptureRequest.JPEG_QUALITY, s.quality.toByte())
             b.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation(c))
@@ -550,6 +747,7 @@ class CameraController(private val ctx: Context) {
     // Prise de vue
 
     fun shoot() {
+        if (settings.video) { toggleRecording(); return }
         if (busy || countdown > 0 || session == null) return
         val t = settings.timer
         if (t <= 0) { capture(); return }
@@ -611,7 +809,176 @@ class CameraController(private val ctx: Context) {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Analyse de scène
+
+    fun onSceneLabels(labels: List<Pair<String, Float>>) {
+        sceneLabels = labels.take(3)
+        var sc = classifyScene(labels)
+        val l = live
+        val dark = l.iso >= 1600 || l.expNs >= 40_000_000L
+        if (dark && !settings.pro && sc != Scene.SCREEN) sc = Scene.NIGHT
+        if (sc == candidate) candidateCount++ else { candidate = sc; candidateCount = 1 }
+        if (candidateCount >= 2 && sc != scene) {
+            scene = sc
+            activeScene = sc
+            if (cfg.sceneAuto) bg.post { updatePreview() }
+        }
+    }
+
+    fun clearScene() {
+        sceneLabels = emptyList()
+        if (scene != Scene.STANDARD) {
+            scene = Scene.STANDARD; activeScene = Scene.STANDARD
+            bg.post { updatePreview() }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Vidéo
+
+    fun toggleRecording() {
+        if (busy) return
+        busy = true
+        pendingOrientation = deviceRotation
+        if (recording) bg.post { finishRecording(); createSession(); main.post { busy = false } }
+        else bg.post { startRecording(); main.post { busy = false } }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startRecording() {
+        val d = device; val c = cur; val ps = previewSurface
+        if (d == null || c == null || ps == null) return
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        val s = cfg
+        val resolver = ctx.contentResolver
+        val name = "VID_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.FRANCE).format(Date()) + ".mp4"
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/PhotoPro")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+        val extOut = if (externalRequest != null) externalOutput else null
+        val uri = extOut ?: resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        val pfd = uri?.let { runCatching { resolver.openFileDescriptor(it, "rw") }.getOrNull() ?: runCatching { resolver.openFileDescriptor(it, "w") }.getOrNull() }
+        if (uri == null || pfd == null) { post("Stockage indisponible"); createSession(); return }
+        val audio = s.videoAudio && ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val sixty = s.fps60 && c.fps60 != null
+        val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else MediaRecorder()
+        try {
+            if (audio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setOutputFile(pfd.fileDescriptor)
+            val px = c.videoSize.width.toLong() * c.videoSize.height
+            val rate = when {
+                px >= 3840L * 2160 -> 45_000_000
+                px >= 1920L * 1080 -> if (sixty) 24_000_000 else 16_000_000
+                else -> 8_000_000
+            }
+            r.setVideoEncodingBitRate(rate)
+            r.setVideoFrameRate(if (sixty) 60 else 30)
+            r.setVideoSize(c.videoSize.width, c.videoSize.height)
+            r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            if (audio) {
+                r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                r.setAudioEncodingBitRate(192_000)
+                r.setAudioSamplingRate(48_000)
+            }
+            r.setOrientationHint(jpegOrientation(c))
+            r.prepare()
+        } catch (e: Exception) {
+            r.release(); pfd.close(); resolver.delete(uri, null, null)
+            post("Enregistrement impossible : ${e.message}")
+            createSession(); return
+        }
+        recorder = r; recPfd = pfd; recUri = uri
+        val rs = r.surface
+        try {
+            d.createCaptureSession(listOf(ps, rs), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(ss: CameraCaptureSession) {
+                    if (device == null) { ss.close(); return }
+                    session = ss
+                    try {
+                        val b = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                        b.addTarget(ps); b.addTarget(rs)
+                        apply(b, capture = false)
+                        ss.setRepeatingRequest(b.build(), previewCallback, bg)
+                        r.start()
+                        recStartedAt = SystemClock.elapsedRealtime()
+                        main.post { recording = true; recSeconds = 0; main.post(recTick) }
+                        if (cfg.sound) main.post { sound.play(MediaActionSound.START_VIDEO_RECORDING) }
+                    } catch (e: Exception) {
+                        post("Enregistrement impossible : ${e.message}")
+                        finishRecording(); createSession()
+                    }
+                }
+                override fun onConfigureFailed(ss: CameraCaptureSession) {
+                    post("Ce format vidéo n'est pas pris en charge, essayez 1080p 30 i/s")
+                    finishRecording(); createSession()
+                }
+            }, bg)
+        } catch (e: Exception) {
+            post("Enregistrement impossible : ${e.message}")
+            finishRecording(); createSession()
+        }
+    }
+
+    /** Arrête l'enregistrement (thread caméra). */
+    private fun finishRecording() {
+        val r = recorder ?: return
+        val uri = recUri
+        recorder = null; recUri = null
+        try { session?.stopRepeating() } catch (_: Exception) {}
+        var ok = recording
+        try { r.stop() } catch (_: RuntimeException) { ok = false }
+        try { r.reset(); r.release() } catch (_: Exception) {}
+        try { recPfd?.close() } catch (_: Exception) {}
+        recPfd = null
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        main.post { recording = false; main.removeCallbacks(recTick) }
+        if (uri == null) return
+        val resolver = ctx.contentResolver
+        val ext = externalRequest
+        val isExtOut = ext != null && externalOutput == uri
+        if (!ok) {
+            if (!isExtOut) try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+            post("Vidéo trop courte, non enregistrée")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 29 && !isExtOut) {
+            val v = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+            try { resolver.update(uri, v, null, null) } catch (_: Exception) {}
+        }
+        if (cfg.sound) main.post { sound.play(MediaActionSound.STOP_VIDEO_RECORDING) }
+        if (ext != null) { main.post { ext(uri, null) }; return }
+        val thumb = try {
+            val mmr = MediaMetadataRetriever()
+            mmr.setDataSource(ctx, uri)
+            val f = mmr.getFrameAtTime(0)
+            mmr.release()
+            f?.let { Bitmap.createScaledBitmap(it, 240, (240f * it.height / it.width).toInt().coerceAtLeast(1), true) }
+        } catch (_: Exception) { null }
+        main.post { lastUri = uri; lastIsVideo = true; if (thumb != null) lastThumb = thumb }
+        post("Vidéo enregistrée dans Films/PhotoPro")
+    }
+
     private fun saveJpeg(bytes: ByteArray) {
+        val ext = externalRequest
+        if (ext != null) {
+            val out = externalOutput
+            if (out != null) {
+                try { ctx.contentResolver.openOutputStream(out, "w")?.use { it.write(bytes) } } catch (_: Exception) {}
+            }
+            main.post { ext(out, bytes) }
+            return
+        }
         val name = "IMG_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.FRANCE).format(Date()) + ".jpg"
         val resolver = ctx.contentResolver
         val values = ContentValues().apply {
@@ -632,7 +999,7 @@ class CameraController(private val ctx: Context) {
             resolver.update(uri, values, null, null)
         }
         val thumb = makeThumb(bytes)
-        main.post { lastUri = uri; if (thumb != null) lastThumb = thumb }
+        main.post { lastUri = uri; lastIsVideo = false; if (thumb != null) lastThumb = thumb }
     }
 
     private fun makeThumb(bytes: ByteArray): Bitmap? = try {
@@ -678,6 +1045,12 @@ class CameraController(private val ctx: Context) {
             sound = prefs.getBoolean("sound", d.sound),
             volumeShutter = prefs.getBoolean("vol", d.volumeShutter),
             level = prefs.getBoolean("level", d.level),
+            video = prefs.getBoolean("video", d.video),
+            videoRes = prefs.getInt("vres", d.videoRes),
+            fps60 = prefs.getBoolean("fps60", d.fps60),
+            videoAudio = prefs.getBoolean("vaudio", d.videoAudio),
+            sceneAnalysis = prefs.getBoolean("scene", d.sceneAnalysis),
+            sceneAuto = prefs.getBoolean("sceneAuto", d.sceneAuto),
         )
     }
 
@@ -689,10 +1062,39 @@ class CameraController(private val ctx: Context) {
             .putBoolean("grid", s.grid).putInt("timer", s.timer).putInt("quality", s.quality)
             .putBoolean("wide", s.wide).putBoolean("stab", s.stabilization).putBoolean("sound", s.sound)
             .putBoolean("vol", s.volumeShutter).putBoolean("level", s.level)
+            .putBoolean("video", s.video).putInt("vres", s.videoRes).putBoolean("fps60", s.fps60)
+            .putBoolean("vaudio", s.videoAudio)
+            .putBoolean("scene", s.sceneAnalysis).putBoolean("sceneAuto", s.sceneAuto)
             .apply()
     }
 
     companion object {
         const val PREVIEW_MAX_EXP = 66_000_000L // 1/15 s
     }
+}
+
+
+/** Associe les étiquettes de l'IA (ML Kit, en anglais) à un type de scène. */
+fun classifyScene(labels: List<Pair<String, Float>>): Scene {
+    val map = listOf(
+        Scene.SCREEN to listOf("monitor", "computer", "screenshot", "television", "display device", "laptop"),
+        Scene.DOCUMENT to listOf("paper", "poster", "menu", "receipt", "newspaper", "handwriting", "text"),
+        Scene.FOOD to listOf("food", "dish", "cuisine", "dessert", "cake", "bread", "pizza", "fast food", "meal",
+            "fruit", "vegetable", "cookie", "sushi", "pasta", "coffee", "drink", "cheese", "sandwich", "salad"),
+        Scene.PET to listOf("dog", "cat", "pet", "bird", "horse", "animal", "insect", "butterfly"),
+        Scene.SPORT to listOf("sports", "basketball", "football", "soccer", "ball", "skateboard", "bicycle", "racing"),
+        Scene.PORTRAIT to listOf("selfie", "smile", "beard", "hair", "eyelash", "skin", "lipstick", "moustache", "person"),
+        Scene.SUNSET to listOf("sunset", "dusk", "sunrise"),
+        Scene.SNOW to listOf("snow", "skiing", "ski", "ice"),
+        Scene.BEACH to listOf("beach", "sand", "surfing"),
+        Scene.FLOWER to listOf("flower", "petal", "plant", "garden", "rose"),
+        Scene.LANDSCAPE to listOf("sky", "mountain", "lake", "river", "cliff", "forest", "field", "waterfall",
+            "sea", "cloud", "nature", "landscape", "tree"),
+    )
+    for ((text, _) in labels.sortedByDescending { it.second }) {
+        val t = text.lowercase(Locale.ROOT)
+        val words = t.split(' ', '-')
+        for ((sc, keys) in map) if (keys.any { t == it || words.contains(it) }) return sc
+    }
+    return Scene.STANDARD
 }
