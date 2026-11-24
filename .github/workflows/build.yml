@@ -22,7 +22,7 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n\t"' > /tmp/ks.b64
-            echo "Longueur du secret : $(wc -c < /tmp/ks.b64) caractères (attendu : 3516)"
+            echo "::notice::Secret KEYSTORE_BASE64 : $(wc -c < /tmp/ks.b64) caractères (attendu 3516), début $(head -c 6 /tmp/ks.b64), fin $(tail -c 6 /tmp/ks.b64)"
             if base64 -d -i /tmp/ks.b64 > app/release.jks 2>/dev/null; then
               echo "Signature fixe activée"
             else
