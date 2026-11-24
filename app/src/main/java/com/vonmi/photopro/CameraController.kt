@@ -83,6 +83,13 @@ data class CamSettings(
     val faces: Boolean = true,
     val qr: Boolean = true,
     val histogram: Boolean = false,
+    val raw: Boolean = false,
+    val watermark: Int = 0,
+    val watermarkText: String = "",
+    val gps: Boolean = false,
+    val peaking: Boolean = true,
+    val gestureShutter: Boolean = false,
+    val voice: Boolean = false,
 )
 
 data class CamCaps(
@@ -118,6 +125,7 @@ data class CamCaps(
     val videoStab: Boolean,
     val sceneModes: List<Int>,
     val faceMode: Int,
+    val rawSize: Size?,
 )
 
 data class LensInfo(
@@ -222,6 +230,28 @@ class CameraController(private val ctx: Context) {
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
+    private var rawReader: ImageReader? = null
+    @Volatile private var curChars: CameraCharacteristics? = null
+    private var rawFailed = false
+    private var pendingRawImage: android.media.Image? = null
+    private var pendingRawResult: TotalCaptureResult? = null
+    private var pendingRawOrientation = 0
+
+    // ---- position GPS ----
+    @Volatile var location: android.location.Location? = null; private set
+    @Volatile var placeName: String? = null; private set
+    private var locListening = false
+    private val locListener = object : android.location.LocationListener {
+        override fun onLocationChanged(l: android.location.Location) {
+            val prev = location
+            location = l
+            if (prev == null || prev.distanceTo(l) > 300f || placeName == null) bg.post { lookupPlace(l) }
+        }
+        @Deprecated("Deprecated in Java")
+        override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
     private var previewSurface: Surface? = null
     private var texture: SurfaceTexture? = null
     private var resumed = false
@@ -241,6 +271,8 @@ class CameraController(private val ctx: Context) {
             main.postDelayed(this, 500)
         }
     }
+
+    init { PostProcess.init(ctx.applicationContext) }
 
     private val orientationListener = object : OrientationEventListener(ctx) {
         override fun onOrientationChanged(o: Int) {
@@ -264,12 +296,14 @@ class CameraController(private val ctx: Context) {
 
     fun onResume() {
         resumed = true
+        startLocation()
         orientationListener.enable()
         openIfReady()
     }
 
     fun onPause() {
         resumed = false
+        stopLocation()
         orientationListener.disable()
         bg.post { closeCamera() }
     }
@@ -334,6 +368,10 @@ class CameraController(private val ctx: Context) {
         device = null
         try { reader?.close() } catch (_: Exception) {}
         reader = null
+        try { pendingRawImage?.close() } catch (_: Exception) {}
+        pendingRawImage = null; pendingRawResult = null
+        try { rawReader?.close() } catch (_: Exception) {}
+        rawReader = null
         previewSurface?.release()
         previewSurface = null
     }
@@ -365,15 +403,36 @@ class CameraController(private val ctx: Context) {
             }
         }, bg)
         reader = r
+        val rs = c.rawSize
+        val rr = if (cfg.raw && !cfg.video && rs != null && !rawFailed) {
+            ImageReader.newInstance(rs.width, rs.height, ImageFormat.RAW_SENSOR, 2).also { raw ->
+                raw.setOnImageAvailableListener({ rd ->
+                    val img = rd.acquireNextImage() ?: return@setOnImageAvailableListener
+                    pendingRawImage?.close()
+                    pendingRawImage = img
+                    tryWriteDng()
+                }, bg)
+            }
+        } else null
+        rawReader = rr
+        val outputs = listOfNotNull(ps, r.surface, rr?.surface)
         try {
-            d.createCaptureSession(listOf(ps, r.surface), object : CameraCaptureSession.StateCallback() {
+            d.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (device == null) { s.close(); return }
                     session = s
                     updatePreview()
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    post("Configuration de la caméra impossible")
+                    if (rr != null) {
+                        rawFailed = true
+                        post("RAW impossible avec ce réglage : photo JPEG seule")
+                        try { rr.close() } catch (_: Exception) {}
+                        rawReader = null
+                        try { r.close() } catch (_: Exception) {}
+                        reader = null
+                        createSession()
+                    } else post("Configuration de la caméra impossible")
                 }
             }, bg)
         } catch (e: Exception) {
@@ -453,6 +512,7 @@ class CameraController(private val ctx: Context) {
 
     private fun buildCaps(id: String): CamCaps {
         val ch = manager.getCameraCharacteristics(id)
+        curChars = ch
         val capsList = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
         val manual = capsList.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
         val front = ch.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT
@@ -521,7 +581,9 @@ class CameraController(private val ctx: Context) {
                     m.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL) -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL
                     else -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
                 }
-            } ?: CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+            } ?: CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF,
+            if (capsList.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW))
+                map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height } else null
         )
     }
 
@@ -552,6 +614,12 @@ class CameraController(private val ctx: Context) {
         settings = newSettings
         cfg = newSettings
         saveSettings(newSettings)
+        if (old.gps != newSettings.gps) { if (newSettings.gps) startLocation() else stopLocation() }
+        if (old.raw != newSettings.raw) {
+            rawFailed = false
+            bg.post { closeCamera(); if (resumed && texture != null) openCamera() }
+            return
+        }
         if (old.sceneAuto != newSettings.sceneAuto || old.sceneAnalysis != newSettings.sceneAnalysis) {
             if (!newSettings.sceneAnalysis) { activeScene = Scene.STANDARD; scene = Scene.STANDARD }
         }
@@ -871,8 +939,14 @@ class CameraController(private val ctx: Context) {
             val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(r.surface)
             b.addTarget(ps)
+            val rr = rawReader
+            val withRaw = rr != null && !burstActive && externalRequest == null
+            if (withRaw) { b.addTarget(rr!!.surface); pendingRawOrientation = jpegOrientation(cur!!) }
             apply(b, capture = true)
             ss.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, req: CaptureRequest, res: TotalCaptureResult) {
+                    if (withRaw) { pendingRawResult = res; tryWriteDng() }
+                }
                 override fun onCaptureStarted(s: CameraCaptureSession, req: CaptureRequest, ts: Long, frame: Long) {
                     main.post {
                         if (cfg.sound) sound.play(MediaActionSound.SHUTTER_CLICK)
@@ -888,6 +962,89 @@ class CameraController(private val ctx: Context) {
         } catch (e: Exception) {
             post("La photo a échoué : ${e.message}")
             main.post { busy = false }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // RAW (DNG)
+
+    private fun tryWriteDng() {
+        val img = pendingRawImage ?: return
+        val res = pendingRawResult ?: return
+        val ch = curChars ?: return
+        pendingRawImage = null; pendingRawResult = null
+        try {
+            val dng = android.hardware.camera2.DngCreator(ch, res)
+            dng.setOrientation(
+                when (pendingRawOrientation) {
+                    90 -> ExifInterface.ORIENTATION_ROTATE_90
+                    180 -> ExifInterface.ORIENTATION_ROTATE_180
+                    270 -> ExifInterface.ORIENTATION_ROTATE_270
+                    else -> ExifInterface.ORIENTATION_NORMAL
+                }
+            )
+            location?.let { dng.setLocation(it) }
+            val name = "IMG_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.FRANCE).format(Date()) + ".dng"
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/x-adobe-dng")
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PhotoPro")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+            val resolver = ctx.contentResolver
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri != null) {
+                resolver.openOutputStream(uri)?.use { dng.writeImage(it, img) }
+                if (Build.VERSION.SDK_INT >= 29) {
+                    values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                }
+                post("Photo + RAW (DNG) enregistrés")
+            }
+            dng.close()
+        } catch (e: Exception) {
+            post("RAW non enregistré : ${e.message}")
+        } finally {
+            img.close()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Position
+
+    @SuppressLint("MissingPermission")
+    fun startLocation() {
+        if (locListening || !cfg.gps) return
+        val ok = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!ok) return
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        runCatching {
+            for (p in listOf(android.location.LocationManager.GPS_PROVIDER, android.location.LocationManager.NETWORK_PROVIDER)) {
+                if (lm.isProviderEnabled(p)) {
+                    lm.getLastKnownLocation(p)?.let { if (location == null) locListener.onLocationChanged(it) }
+                    lm.requestLocationUpdates(p, 15_000L, 20f, locListener, Looper.getMainLooper())
+                }
+            }
+            locListening = true
+        }
+    }
+
+    fun stopLocation() {
+        if (!locListening) return
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        runCatching { lm.removeUpdates(locListener) }
+        locListening = false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun lookupPlace(l: android.location.Location) {
+        runCatching {
+            if (!android.location.Geocoder.isPresent()) return
+            val a = android.location.Geocoder(ctx, Locale.FRANCE).getFromLocation(l.latitude, l.longitude, 1)?.firstOrNull()
+            if (a != null) placeName = listOfNotNull(a.locality ?: a.subAdminArea, a.countryName).joinToString(", ")
         }
     }
 
@@ -1124,7 +1281,11 @@ class CameraController(private val ctx: Context) {
         post("Vidéo enregistrée dans Films/PhotoPro")
     }
 
-    private fun saveJpeg(bytes: ByteArray) {
+    private fun saveJpeg(original: ByteArray) {
+        val st = cfg
+        val bytes = if (st.watermark > 0 || st.watermarkText.isNotBlank() || (st.gps && location != null)) {
+            PostProcess.apply(ctx, original, st.watermark, st.watermarkText, if (st.gps) location else null, placeName, st.quality)
+        } else original
         val ext = externalRequest
         if (ext != null) {
             val out = externalOutput
@@ -1210,6 +1371,13 @@ class CameraController(private val ctx: Context) {
             faces = prefs.getBoolean("faces", d.faces),
             qr = prefs.getBoolean("qr", d.qr),
             histogram = prefs.getBoolean("histo", d.histogram),
+            raw = prefs.getBoolean("raw", d.raw),
+            watermark = prefs.getInt("wm", d.watermark),
+            watermarkText = prefs.getString("wmText", d.watermarkText) ?: "",
+            gps = prefs.getBoolean("gps", d.gps),
+            peaking = prefs.getBoolean("peak", d.peaking),
+            gestureShutter = prefs.getBoolean("gesture", d.gestureShutter),
+            voice = prefs.getBoolean("voice", d.voice),
         )
     }
 
@@ -1225,7 +1393,9 @@ class CameraController(private val ctx: Context) {
             .putBoolean("vaudio", s.videoAudio)
             .putBoolean("scene", s.sceneAnalysis).putBoolean("sceneAuto", s.sceneAuto)
             .putBoolean("fill", s.fillPreview).putBoolean("faces", s.faces).putBoolean("qr", s.qr)
-            .putBoolean("histo", s.histogram)
+            .putBoolean("histo", s.histogram).putBoolean("raw", s.raw).putInt("wm", s.watermark)
+            .putString("wmText", s.watermarkText).putBoolean("gps", s.gps).putBoolean("peak", s.peaking)
+            .putBoolean("gesture", s.gestureShutter).putBoolean("voice", s.voice)
             .apply()
     }
 

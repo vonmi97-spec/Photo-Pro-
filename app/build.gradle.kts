@@ -12,8 +12,8 @@ android {
         applicationId = "com.vonmi.photopro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "2.4"
+        versionCode = 10
+        versionName = "3.0"
     }
     // Signature fixe : la clé vient des secrets GitHub (jamais stockée dans le dépôt)
     val ksFile = file("release.jks")
@@ -52,4 +52,11 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.google.mlkit:image-labeling:17.0.9")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    implementation("com.google.mlkit:face-detection:16.1.7")
+    implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:language-id:17.0.6")
+    implementation("com.google.mlkit:translate:17.0.3")
+    implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

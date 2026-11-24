@@ -57,6 +57,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.activity.result.IntentSenderRequest
+import androidx.lifecycle.compose.currentStateAsState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -227,17 +231,30 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
     val analyzer = remember { SceneAnalyzer() }
     DisposableEffect(Unit) { onDispose { analyzer.close() } }
     val wantScene = s.sceneAnalysis && !s.pro
-    LaunchedEffect(wantScene, s.qr, s.histogram, textureRef) {
+    val gesture = remember { GestureTrigger() }
+    DisposableEffect(Unit) { onDispose { gesture.close() } }
+    var lastGesture by remember { mutableLongStateOf(0L) }
+    val wantGesture = s.gestureShutter && !s.video
+    LaunchedEffect(wantScene, s.qr, s.histogram, wantGesture, textureRef) {
         val tv = textureRef ?: return@LaunchedEffect
         if (!wantScene) ctrl.clearScene()
-        if (!wantScene && !s.qr && !s.histogram) return@LaunchedEffect
+        if (!wantScene && !s.qr && !s.histogram && !wantGesture) return@LaunchedEffect
         while (true) {
-            delay(if (s.histogram) 600 else 1000)
+            delay(if (wantGesture) 450 else if (s.histogram) 600 else 1000)
             if (!tv.isAvailable || tv.width == 0) continue
-            val w = if (s.qr) 720 else 256
+            val w = if (s.qr) 720 else if (wantGesture) 480 else 256
             val h = (w.toFloat() * tv.height / tv.width).roundToInt().coerceAtLeast(1)
             val bmp = runCatching { tv.getBitmap(w, h) }.getOrNull() ?: continue
             if (s.histogram) ctrl.computeHistogram(bmp)
+            if (wantGesture && !ctrl.busy && ctrl.countdown == 0 && System.currentTimeMillis() - lastGesture > 4000) {
+                gesture.check(bmp) { kind ->
+                    if (System.currentTimeMillis() - lastGesture > 4000 && !ctrl.busy) {
+                        lastGesture = System.currentTimeMillis()
+                        ctrl.message = if (kind == "sourire") "😊 Sourire détecté" else "✋ Main levée"
+                        ctrl.shoot()
+                    }
+                }
+            }
             analyzer.analyze(
                 bmp, labels = wantScene, barcodes = s.qr,
                 onLabels = { ctrl.onSceneLabels(it) },
@@ -251,6 +268,76 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
         val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) ctrl.onResume() }
         lifecycle.addObserver(obs)
         onDispose { lifecycle.removeObserver(obs) }
+    }
+
+    // ---- Focus peaking ----
+    var peakImg by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    val wantPeak = s.peaking && s.manualFocus
+    LaunchedEffect(wantPeak, textureRef) {
+        val tv = textureRef
+        if (!wantPeak || tv == null) { peakImg = null; return@LaunchedEffect }
+        while (true) {
+            delay(160)
+            if (!tv.isAvailable || tv.width == 0) continue
+            val h = (360f * tv.height / tv.width).roundToInt().coerceAtLeast(1)
+            val bmp = runCatching { tv.getBitmap(360, h) }.getOrNull() ?: continue
+            peakImg = withContext(Dispatchers.Default) { computePeaking(bmp).asImageBitmap() }
+        }
+    }
+
+    // ---- Commande vocale ----
+    val resumedState by lifecycle.currentStateAsState()
+    val isResumed = resumedState.isAtLeast(Lifecycle.State.RESUMED)
+    val voice = remember {
+        VoiceShutter(context.applicationContext) { cmd ->
+            val cs = ctrl.settings
+            when (cmd) {
+                "photo" -> if (!cs.video) { ctrl.message = "🎙 Photo !"; ctrl.shoot() }
+                "video" -> if (cs.video && !ctrl.recording) ctrl.shoot()
+            }
+        }
+    }
+    DisposableEffect(s.voice, ctrl.recording, isResumed) {
+        if (s.voice && !ctrl.recording && isResumed) voice.start()
+        onDispose { voice.stop() }
+    }
+
+    // ---- Outils : scanner et texte ----
+    var showTools by remember { mutableStateOf(false) }
+    var ocrText by remember { mutableStateOf<String?>(null) }
+    val scanLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+        if (res.resultCode == android.app.Activity.RESULT_OK) {
+            val r = com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult.fromActivityResultIntent(res.data)
+            val pdf = r?.pdf?.uri
+            if (pdf != null) {
+                val saved = savePdf(context, pdf) ?: pdf
+                ctrl.message = "PDF enregistré dans Documents/PhotoPro"
+                runCatching {
+                    context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(saved, "application/pdf")
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }
+        }
+    }
+    val startScan = {
+        val act = context.findActivity()
+        if (act != null) {
+            val opts = com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.Builder()
+                .setGalleryImportAllowed(true).setPageLimit(30)
+                .setResultFormats(
+                    com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.RESULT_FORMAT_PDF,
+                    com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.RESULT_FORMAT_JPEG
+                )
+                .setScannerMode(com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                .build()
+            com.google.mlkit.vision.documentscanner.GmsDocumentScanning.getClient(opts).getStartScanIntent(act)
+                .addOnSuccessListener { sender -> scanLauncher.launch(IntentSenderRequest.Builder(sender).build()) }
+                .addOnFailureListener { ctrl.message = "Scanner indisponible (services Google Play requis)" }
+        }
+    }
+    val startOcr = {
+        val bmp = textureRef?.let { runCatching { it.bitmap }.getOrNull() }
+        if (bmp != null) { ctrl.message = "Lecture du texte…"; recognizeText(bmp) { ocrText = it } }
     }
 
     val msg = ctrl.message
@@ -300,6 +387,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                 },
                 modifier = Modifier.fillMaxSize()
             )
+            peakImg?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
             Overlay(ctrl)
         }
 
@@ -327,8 +415,9 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                     val i = opts.indexOf(s.videoRes)
                     ctrl.update(s.copy(videoRes = opts[(i + 1) % opts.size]))
                 } else TopButton(if (s.wide) "16:9" else "4:3", active = false) { ctrl.update(s.copy(wide = !s.wide)) }
-                TopButton(if (fill) "⛶ Plein" else "▭ Cadre", active = false) { ctrl.update(s.copy(fillPreview = !fill)) }
+                TopButton(if (fill) "⛶" else "▭", active = false) { ctrl.update(s.copy(fillPreview = !fill)) }
                 TopButton("▶", active = false, enabled = !ctrl.recording) { onOpenPlayer() }
+                TopButton("🧰", active = false, enabled = !ctrl.recording) { showTools = true }
                 IconButton(onClick = { showSettings = true }) {
                     Icon(Icons.Default.Settings, contentDescription = "Réglages", tint = Color.White, modifier = Modifier.rotate(uiRot))
                 }
@@ -364,6 +453,11 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
+                    if (s.voice || wantGesture) Text(
+                        listOfNotNull(if (s.voice) "🎙 « photo »" else null, if (wantGesture) "😊✋ auto" else null).joinToString("  "),
+                        color = Color.White, fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 4.dp).background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
                     if (ctrl.locked) Text(
                         "🔒 AE/AF verrouillé", color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 4.dp).clip(RoundedCornerShape(12.dp)).background(Color(0x99000000))
@@ -563,6 +657,8 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
 
     }
     if (showSettings) SettingsDialog(ctrl, caps) { showSettings = false }
+    if (showTools) ToolsSheet(onScan = { startScan() }, onText = { startOcr() }, onClose = { showTools = false })
+    ocrText?.let { t -> TextResultDialog(t) { ocrText = null } }
 }
 
 @Composable
@@ -720,6 +816,14 @@ private fun LabelRow(title: String, value: String, onReset: (() -> Unit)?) {
 private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -> Unit) {
     val s = ctrl.settings
     val ctx = androidx.compose.ui.platform.LocalContext.current
+    val locLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+        val ok = res.values.any { it }
+        ctrl.update(ctrl.settings.copy(gps = ok))
+        if (!ok) ctrl.message = "Position refusée"
+    }
+    val askLocation = {
+        locLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+    }
     androidx.compose.ui.window.Dialog(
         onDismissRequest = onClose,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
@@ -739,6 +843,20 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
                         listOf("Max" to 100, "Haute" to 95, "Moyenne" to 85, "Légère" to 70), s.quality) { ctrl.update(s.copy(quality = it)) }
                     ChoiceRow("Format", caps?.let { "Photo : ${"%.1f".format(Locale.FRANCE, it.jpegSize.width * it.jpegSize.height / 1e6)} Mpx" },
                         listOf("4:3" to false, "16:9" to true), s.wide) { ctrl.update(s.copy(wide = it)) }
+                    if (caps?.rawSize != null)
+                        ToggleRow("Photo RAW (DNG) en plus", "Fichier brut retouchable sans perte (Lightroom, Snapseed…)", s.raw) { ctrl.update(s.copy(raw = it)) }
+                    ChoiceRow("Filigrane", "Inscrit en bas à droite de la photo",
+                        listOf("Aucun" to 0, "Date" to 1, "Date + lieu" to 2), s.watermark) {
+                        ctrl.update(s.copy(watermark = it))
+                        if (it == 2 && !s.gps) askLocation()
+                    }
+                    OutlinedTextField(
+                        value = s.watermarkText, onValueChange = { ctrl.update(s.copy(watermarkText = it.take(40))) },
+                        label = { Text("Texte perso du filigrane (facultatif)") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                    )
+                    ToggleRow("Position GPS", "Enregistre le lieu de la photo (visible sur la carte de la galerie)", s.gps) {
+                        if (it) askLocation() else ctrl.update(s.copy(gps = false))
+                    }
                     ToggleRow("Son du déclencheur", null, s.sound) { ctrl.update(s.copy(sound = it)) }
                     ToggleRow("Boutons volume pour déclencher", "Volume + ou − prend la photo / lance la vidéo", s.volumeShutter) { ctrl.update(s.copy(volumeShutter = it)) }
                 }
@@ -757,6 +875,11 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
                     ToggleRow("Histogramme", "Répartition des zones sombres / claires", s.histogram) { ctrl.update(s.copy(histogram = it)) }
                     if ((caps?.faceMode ?: 0) != 0)
                         ToggleRow("Détection des visages", "Cadre les visages et fait la mise au point dessus", s.faces) { ctrl.update(s.copy(faces = it)) }
+                }
+                Section("🎯", "Aides à la prise de vue") {
+                    ToggleRow("Focus peaking", "En mise au point manuelle, les zones nettes s'allument en vert", s.peaking) { ctrl.update(s.copy(peaking = it)) }
+                    ToggleRow("Déclencher par sourire ou main levée", "La photo se prend toute seule (pratique sur trépied)", s.gestureShutter) { ctrl.update(s.copy(gestureShutter = it)) }
+                    ToggleRow("Commande vocale", "Dites « photo », « ouistiti » ou « cheese » · en vidéo : « action »", s.voice) { ctrl.update(s.copy(voice = it)) }
                 }
                 Section("✨", "Intelligence artificielle") {
                     ToggleRow("Reconnaître la scène", "Nuit, portrait, paysage, nourriture, écran… (sur le téléphone, sans internet)", s.sceneAnalysis) { ctrl.update(s.copy(sceneAnalysis = it)) }
