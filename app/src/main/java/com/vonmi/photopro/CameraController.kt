@@ -50,6 +50,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 enum class FlashMode(val label: String) { OFF("Off"), AUTO("Auto"), ON("On"), TORCH("Torche") }
@@ -90,6 +91,12 @@ data class CamSettings(
     val peaking: Boolean = true,
     val gestureShutter: Boolean = false,
     val voice: Boolean = false,
+    /** Mode photo spécial : 0 aucun, 1 Nuit, 2 HDR, 3 Panorama. */
+    val special: Int = 0,
+    /** Type de vidéo : 0 normale, 1 ralenti, 2 timelapse. */
+    val videoKind: Int = 0,
+    val lapseMs: Int = 1000,
+    val slowFps: Int = 120,
 )
 
 data class CamCaps(
@@ -126,6 +133,8 @@ data class CamCaps(
     val sceneModes: List<Int>,
     val faceMode: Int,
     val rawSize: Size?,
+    /** Ralenti « vrai » (haute vitesse) : taille + images/s. */
+    val slowModes: List<Pair<Size, Int>>,
 )
 
 data class LensInfo(
@@ -387,16 +396,19 @@ class CameraController(private val ctx: Context) {
         val r = ImageReader.newInstance(c.jpegSize.width, c.jpegSize.height, ImageFormat.JPEG, 2)
         r.setOnImageAvailableListener({ rd ->
             val img = rd.acquireNextImage() ?: return@setOnImageAvailableListener
+            val sink = frameSink
             try {
                 val buf = img.planes[0].buffer
                 val bytes = ByteArray(buf.remaining())
                 buf.get(bytes)
-                saveJpeg(bytes)
+                if (sink != null) sink(bytes) else saveJpeg(bytes)
             } catch (e: Exception) {
                 post("Échec de l'enregistrement")
             } finally {
                 img.close()
-                if (burstActive) {
+                if (sink != null) {
+                    // capture multi-images : rien d'autre à faire ici
+                } else if (burstActive) {
                     main.post { burstCount++; if (burstCount >= MAX_BURST) stopBurst() }
                     bg.postDelayed({ if (burstActive) still() else main.post { busy = false } }, 30)
                 } else main.post { busy = false }
@@ -583,7 +595,12 @@ class CameraController(private val ctx: Context) {
                 }
             } ?: CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF,
             if (capsList.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW))
-                map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height } else null
+                map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height } else null,
+            if (capsList.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO)) runCatching {
+                map.highSpeedVideoSizes.flatMap { sz ->
+                    map.getHighSpeedVideoFpsRangesFor(sz).filter { it.lower == it.upper && it.upper >= 120 }.map { sz to it.upper }
+                }.distinct()
+            }.getOrDefault(emptyList()) else emptyList()
         )
     }
 
@@ -872,7 +889,7 @@ class CameraController(private val ctx: Context) {
         }
 
         if (s.video) {
-            val fr = if (s.fps60 && c.fps60 != null) c.fps60 else c.fps30
+            val fr = if ((s.fps60 || s.videoKind == 1) && c.fps60 != null) c.fps60 else c.fps30
             if (fr != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fr)
             if (c.videoStab) b.set(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
@@ -899,6 +916,11 @@ class CameraController(private val ctx: Context) {
     fun shoot() {
         if (settings.video) { toggleRecording(); return }
         if (busy || countdown > 0 || session == null) return
+        if (!settings.pro && externalRequest == null) when (settings.special) {
+            1 -> { multiShot(night = true); return }
+            2 -> { multiShot(night = false); return }
+            3 -> { onPanoToggle?.invoke(); return }
+        }
         val t = settings.timer
         if (t <= 0) { capture(); return }
         countdown = t
@@ -964,6 +986,115 @@ class CameraController(private val ctx: Context) {
             main.post { busy = false }
         }
     }
+
+    // ------------------------------------------------------------------
+    // Multi-images : Nuit et HDR
+
+    @Volatile private var frameSink: ((ByteArray) -> Unit)? = null
+    var processing by mutableStateOf<String?>(null); private set
+    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    private fun multiShot(night: Boolean) {
+        val c = cur ?: return
+        val l = live
+        val manual = c.manualSensor && l.iso > 0 && l.expNs > 0
+        if (!night && !manual) { message = "HDR indisponible sur cet objectif (réglages manuels requis)"; return }
+        busy = true
+        pendingOrientation = deviceRotation
+        processing = if (night) "🌙 Nuit : ne bougez pas…" else "HDR : ne bougez pas…"
+        val n = if (night) 6 else 3
+        val maxExp = if (night) 125_000_000L else 500_000_000L
+        val exps = if (night) List(n) { min(l.expNs, maxExp) } else listOf(l.expNs / 4, l.expNs, l.expNs * 4)
+        bg.post {
+            captureFrames(n, { i, b ->
+                b.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+                b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                if (manual) {
+                    val e = exps[i].coerceIn(c.expRange.lower, min(c.expRange.upper, maxExp))
+                    var iso = l.iso
+                    // Pose trop longue pour le capteur : on compense avec les ISO
+                    if (e < exps[i]) iso = (iso * (exps[i].toDouble() / e)).roundToInt().coerceIn(c.isoRange.lower, c.isoRange.upper)
+                    if (night && l.expNs > maxExp) iso = (l.iso * (l.expNs.toDouble() / e)).roundToInt().coerceIn(c.isoRange.lower, c.isoRange.upper)
+                    b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                    b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, e)
+                    b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                    b.set(CaptureRequest.SENSOR_FRAME_DURATION, e)
+                }
+            }) { frames ->
+                main.post { processing = if (night) "🌙 Assemblage de ${frames.size} images…" else "HDR : fusion…" }
+                val out = try {
+                    val fused = if (night) Fusion.night(frames, cfg.quality) else Fusion.hdr(frames, cfg.quality)
+                    PostProcess.copyOrientation(frames[0], fused)
+                } catch (t: Throwable) {
+                    post(if (t is OutOfMemoryError) "Mémoire insuffisante : photo normale gardée" else "Fusion impossible : photo normale gardée")
+                    frames[frames.size / 2]
+                }
+                bg.post {
+                    try { saveJpeg(out) } catch (_: Exception) {}
+                    main.post { busy = false; processing = null; message = if (night) "🌙 Photo de nuit enregistrée" else "HDR enregistré" }
+                }
+            }
+        }
+    }
+
+    /** Prend n photos à la suite (sans les enregistrer) puis appelle onDone sur un fil de calcul. */
+    private fun captureFrames(n: Int, configure: (Int, CaptureRequest.Builder) -> Unit, onDone: (List<ByteArray>) -> Unit) {
+        val ss = session; val d = device; val r = reader; val ps = previewSurface
+        if (ss == null || d == null || r == null || ps == null) { main.post { busy = false; processing = null }; return }
+        val frames = ArrayList<ByteArray>()
+        frameSink = { bytes ->
+            frames += bytes
+            if (frames.size == n) { frameSink = null; worker.execute { onDone(frames) } }
+        }
+        var first = true
+        try {
+            val reqs = (0 until n).map { i ->
+                d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(r.surface); addTarget(ps)
+                    apply(this, capture = true)
+                    configure(i, this)
+                }.build()
+            }
+            ss.captureBurst(reqs, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureStarted(s: CameraCaptureSession, req: CaptureRequest, ts: Long, frame: Long) {
+                    if (first) { first = false; main.post { if (cfg.sound) sound.play(MediaActionSound.SHUTTER_CLICK); flashScreen++ } }
+                }
+                override fun onCaptureFailed(s: CameraCaptureSession, req: CaptureRequest, f: CaptureFailure) {
+                    if (frameSink != null) {
+                        frameSink = null
+                        post("Prise de vue interrompue")
+                        main.post { busy = false; processing = null }
+                    }
+                }
+            }, bg)
+            bg.postDelayed({
+                if (frameSink != null) { frameSink = null; post("Délai dépassé"); main.post { busy = false; processing = null } }
+            }, 20_000)
+        } catch (e: Exception) {
+            frameSink = null
+            post("Prise de vue impossible : ${e.message}")
+            main.post { busy = false; processing = null }
+        }
+    }
+
+    /** Enregistre une image déjà calculée (panorama). */
+    fun saveBitmap(bmp: Bitmap, done: String) {
+        busy = true
+        worker.execute {
+            val bos = java.io.ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, cfg.quality, bos)
+            bg.post {
+                try { saveJpeg(bos.toByteArray()) } catch (_: Exception) {}
+                main.post { busy = false; message = done }
+            }
+        }
+    }
+
+    fun setProcessing(text: String?) { processing = text }
+
+    /** Démarrer / terminer le panorama (géré par l'écran, qui lit les images de l'aperçu). */
+    var onPanoToggle: (() -> Unit)? = null
 
     // ------------------------------------------------------------------
     // RAW (DNG)
@@ -1179,10 +1310,16 @@ class CameraController(private val ctx: Context) {
         if (uri == null || pfd == null) { post("Stockage indisponible"); createSession(); return }
         val audio = s.videoAudio && ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        val sixty = s.fps60 && c.fps60 != null
+        val kind = s.videoKind
+        val hs = if (kind == 1) c.slowModes.filter { it.second == s.slowFps && it.first.width <= 1920 }
+            .maxByOrNull { it.first.width } ?: c.slowModes.filter { it.first.width <= 1920 }.minByOrNull { abs(it.second - s.slowFps) }
+        else null
+        val slowFps = hs?.second ?: if (c.fps60 != null) 60 else 30
+        val sixty = (s.fps60 || kind == 1) && c.fps60 != null
         val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else MediaRecorder()
         try {
-            if (audio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+            val withAudio = audio && kind == 0
+            if (withAudio) r.setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
             r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setOutputFile(pfd.fileDescriptor)
@@ -1192,11 +1329,26 @@ class CameraController(private val ctx: Context) {
                 px >= 1920L * 1080 -> if (sixty) 24_000_000 else 16_000_000
                 else -> 8_000_000
             }
-            r.setVideoEncodingBitRate(rate)
-            r.setVideoFrameRate(if (sixty) 60 else 30)
-            r.setVideoSize(c.videoSize.width, c.videoSize.height)
+            val vsize = hs?.first ?: c.videoSize
+            when (kind) {
+                1 -> { // ralenti : capturé vite, lu à 30 i/s
+                    r.setVideoEncodingBitRate(min(60_000_000, rate * slowFps / 30))
+                    r.setVideoFrameRate(30)
+                    r.setCaptureRate(slowFps.toDouble())
+                }
+                2 -> { // timelapse : 1 image toutes les lapseMs, lue à 30 i/s
+                    r.setVideoEncodingBitRate(rate)
+                    r.setVideoFrameRate(30)
+                    r.setCaptureRate(1000.0 / s.lapseMs)
+                }
+                else -> {
+                    r.setVideoEncodingBitRate(rate)
+                    r.setVideoFrameRate(if (sixty) 60 else 30)
+                }
+            }
+            r.setVideoSize(vsize.width, vsize.height)
             r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            if (audio) {
+            if (withAudio) {
                 r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                 r.setAudioEncodingBitRate(192_000)
                 r.setAudioSamplingRate(48_000)
@@ -1210,6 +1362,7 @@ class CameraController(private val ctx: Context) {
         }
         recorder = r; recPfd = pfd; recUri = uri
         val rs = r.surface
+        if (hs != null) { startHighSpeed(d, ps, rs, r, hs.first, hs.second); return }
         try {
             d.createCaptureSession(listOf(ps, rs), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(ss: CameraCaptureSession) {
@@ -1237,6 +1390,42 @@ class CameraController(private val ctx: Context) {
             }, bg)
         } catch (e: Exception) {
             post("Enregistrement impossible : ${e.message}")
+            finishRecording(); createSession()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startHighSpeed(d: CameraDevice, ps: Surface, rs: Surface, r: MediaRecorder, size: Size, fps: Int) {
+        texture?.setDefaultBufferSize(size.width, size.height)
+        try {
+            d.createConstrainedHighSpeedCaptureSession(listOf(ps, rs), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(ss: CameraCaptureSession) {
+                    if (device == null) { ss.close(); return }
+                    session = ss
+                    try {
+                        val hss = ss as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
+                        val b = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                        b.addTarget(ps); b.addTarget(rs)
+                        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+                        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        hss.setRepeatingBurst(hss.createHighSpeedRequestList(b.build()), null, bg)
+                        r.start()
+                        recStartedAt = SystemClock.elapsedRealtime()
+                        pausedAccum = 0L
+                        main.post { recording = true; recSeconds = 0; main.post(recTick); message = "Ralenti $fps i/s" }
+                    } catch (e: Exception) {
+                        post("Ralenti impossible : ${e.message}")
+                        finishRecording(); createSession()
+                    }
+                }
+                override fun onConfigureFailed(ss: CameraCaptureSession) {
+                    post("Ralenti $fps i/s refusé par la caméra")
+                    finishRecording(); createSession()
+                }
+            }, bg)
+        } catch (e: Exception) {
+            post("Ralenti impossible : ${e.message}")
             finishRecording(); createSession()
         }
     }
@@ -1278,7 +1467,7 @@ class CameraController(private val ctx: Context) {
             f?.let { Bitmap.createScaledBitmap(it, 240, (240f * it.height / it.width).toInt().coerceAtLeast(1), true) }
         } catch (_: Exception) { null }
         main.post { lastUri = uri; lastIsVideo = true; if (thumb != null) lastThumb = thumb }
-        post("Vidéo enregistrée dans Films/PhotoPro")
+        post(when (cfg.videoKind) { 1 -> "Ralenti enregistré"; 2 -> "Timelapse enregistré"; else -> "Vidéo enregistrée" } + " dans Films/PhotoPro")
     }
 
     private fun saveJpeg(original: ByteArray) {
@@ -1378,6 +1567,10 @@ class CameraController(private val ctx: Context) {
             peaking = prefs.getBoolean("peak", d.peaking),
             gestureShutter = prefs.getBoolean("gesture", d.gestureShutter),
             voice = prefs.getBoolean("voice", d.voice),
+            special = prefs.getInt("special", d.special),
+            videoKind = prefs.getInt("vkind", d.videoKind),
+            lapseMs = prefs.getInt("lapse", d.lapseMs),
+            slowFps = prefs.getInt("slowFps", d.slowFps),
         )
     }
 
@@ -1396,6 +1589,7 @@ class CameraController(private val ctx: Context) {
             .putBoolean("histo", s.histogram).putBoolean("raw", s.raw).putInt("wm", s.watermark)
             .putString("wmText", s.watermarkText).putBoolean("gps", s.gps).putBoolean("peak", s.peaking)
             .putBoolean("gesture", s.gestureShutter).putBoolean("voice", s.voice)
+            .putInt("special", s.special).putInt("vkind", s.videoKind).putInt("lapse", s.lapseMs).putInt("slowFps", s.slowFps)
             .apply()
     }
 

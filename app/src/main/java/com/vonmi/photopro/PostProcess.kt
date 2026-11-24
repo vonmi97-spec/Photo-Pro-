@@ -92,6 +92,14 @@ object PostProcess {
         return res
     }
 
+    /** Recopie l'orientation (et les infos de prise de vue) de la photo source vers la photo fusionnée. */
+    fun copyOrientation(src: ByteArray, out: ByteArray): ByteArray {
+        val e = runCatching { ExifInterface(ByteArrayInputStream(src)) }.getOrNull() ?: return out
+        val tags = keptTags + ExifInterface.TAG_ORIENTATION
+        val vals = tags.associateWith { e.getAttribute(it) }
+        return withTempFile(null, out) { x -> vals.forEach { (k, v) -> if (v != null) x.setAttribute(k, v) } }
+    }
+
     private fun addGps(ctx: Context, bytes: ByteArray, loc: Location): ByteArray =
         withTempFile(ctx, bytes) { exif -> exif.setGpsInfo(loc) }
 

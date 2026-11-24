@@ -33,3 +33,10 @@ Onglet **Actions** → dernière exécution « Build APK » → artefact **Appar
 - **Histogramme** en direct
 - Vidéo : **pause / reprise** et **photo pendant l'enregistrement**
 - Retardateur 2 / 5 / 10 s, panneau de réglages repliable
+
+## Nouveautés 3.x
+- **Outils** : scanner de documents (PDF), lecture / traduction de texte
+- Filigrane date/lieu, position GPS, **RAW (DNG)**
+- Focus peaking, déclenchement par **sourire / main levée**, **commande vocale**
+- Modes **NUIT** (6 images alignées et fusionnées), **HDR** (3 expositions), **PANO**
+- Vidéo **RALENTI** (haute vitesse si disponible, sinon ×2) et **TIMELAPSE**

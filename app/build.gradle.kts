@@ -12,8 +12,10 @@ android {
         applicationId = "com.vonmi.photopro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "3.0"
+        versionCode = 11
+        versionName = "3.1"
+        // Seulement les processeurs 64 bits ARM (tous les téléphones récents) : APK bien plus léger
+        ndk { abiFilters += listOf("arm64-v8a") }
     }
     // Signature fixe : la clé vient des secrets GitHub (jamais stockée dans le dépôt)
     val ksFile = file("release.jks")

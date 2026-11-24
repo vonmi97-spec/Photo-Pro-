@@ -340,6 +340,40 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
         if (bmp != null) { ctrl.message = "Lecture du texte…"; recognizeText(bmp) { ocrText = it } }
     }
 
+    // ---- Panorama ----
+    var panoRunning by remember { mutableStateOf(false) }
+    var pano by remember { mutableStateOf<PanoramaBuilder?>(null) }
+    var panoProgress by remember { mutableFloatStateOf(0f) }
+    var panoFast by remember { mutableStateOf(false) }
+    DisposableEffect(Unit) {
+        ctrl.onPanoToggle = { if (!ctrl.busy) panoRunning = !panoRunning }
+        onDispose { ctrl.onPanoToggle = null }
+    }
+    LaunchedEffect(panoRunning) {
+        val tv = textureRef
+        if (panoRunning && tv != null) {
+            val b = PanoramaBuilder(); pano = b; panoProgress = 0f
+            while (true) {
+                delay(220)
+                if (!tv.isAvailable || tv.width == 0) continue
+                val h = (720f * tv.height / tv.width).roundToInt().coerceAtLeast(1)
+                val bmp = runCatching { tv.getBitmap(720, h) }.getOrNull() ?: continue
+                val more = withContext(Dispatchers.Default) { b.add(bmp) }
+                panoProgress = b.progress; panoFast = b.tooFast
+                if (!more) { panoRunning = false; break }
+            }
+        } else {
+            val b = pano ?: return@LaunchedEffect
+            pano = null
+            delay(300)
+            ctrl.setProcessing("Assemblage du panorama…")
+            val res = withContext(Dispatchers.Default) { runCatching { b.build() }.getOrNull() }
+            b.recycle()
+            ctrl.setProcessing(null)
+            if (res != null) ctrl.saveBitmap(res, "Panorama enregistré") else ctrl.message = "Panorama trop court : tournez plus loin vers la droite"
+        }
+    }
+
     val msg = ctrl.message
     LaunchedEffect(msg) { if (msg != null) { delay(2500); ctrl.message = null } }
     val qr = ctrl.qrText
@@ -406,9 +440,21 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                     val next = FlashMode.entries[(s.flash.ordinal + 1) % FlashMode.entries.size]
                     ctrl.update(s.copy(flash = next))
                 }
-                TopButton(if (s.timer == 0) "⏱ Off" else "⏱ ${s.timer}s", enabled = !s.video, active = s.timer > 0) {
+                if (!s.video) TopButton(if (s.timer == 0) "⏱ Off" else "⏱ ${s.timer}s", active = s.timer > 0) {
                     val next = when (s.timer) { 0 -> 2; 2 -> 5; 5 -> 10; else -> 0 }
                     ctrl.update(s.copy(timer = next))
+                } else if (s.videoKind == 1) {
+                    val opts = caps?.slowModes?.map { it.second }?.distinct()?.sorted().orEmpty()
+                    TopButton(if (opts.isEmpty()) "×2" else "${s.slowFps} i/s", active = true, enabled = opts.size > 1 && !ctrl.recording) {
+                        val i = opts.indexOf(s.slowFps)
+                        ctrl.update(s.copy(slowFps = opts[(i + 1) % opts.size]))
+                    }
+                } else if (s.videoKind == 2) {
+                    TopButton("⏲ ${fmtLapse(s.lapseMs)}", active = true, enabled = !ctrl.recording) {
+                        val opts = listOf(500, 1000, 2000, 5000, 10000)
+                        val i = opts.indexOf(s.lapseMs)
+                        ctrl.update(s.copy(lapseMs = opts[(i + 1) % opts.size]))
+                    }
                 }
                 if (s.video) TopButton(if (s.videoRes == 2160) "4K" else "${s.videoRes}p", active = false, enabled = !ctrl.recording) {
                     val opts = caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)
@@ -426,7 +472,9 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                 if (caps != null) append(caps.label)
                 if (caps?.aperture != null) append(" · f/${fmt1(caps.aperture)}")
                 append("   ")
-                if (s.video) append("${if (s.videoRes == 2160) "4K" else "${s.videoRes}p"} · ${if (s.fps60 && caps?.fps60 != null) 60 else 30} i/s")
+                if (s.video && s.videoKind == 1) append("Ralenti ×${((caps?.slowModes?.firstOrNull { it.second == s.slowFps }?.second ?: if (caps?.fps60 != null) 60 else 30) / 30)}")
+                else if (s.video && s.videoKind == 2) append("Timelapse : 1 image / ${fmtLapse(s.lapseMs)} (×${30 * s.lapseMs / 1000})")
+                else if (s.video) append("${if (s.videoRes == 2160) "4K" else "${s.videoRes}p"} · ${if (s.fps60 && caps?.fps60 != null) 60 else 30} i/s")
                 else if (s.pro) append("ISO ${s.iso} · ${formatShutter(s.exposureNs)}")
                 else if (ctrl.live.iso > 0) append("ISO ${ctrl.live.iso} · ${formatShutter(ctrl.live.expNs)}")
             }
@@ -467,6 +515,25 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                 val hist = ctrl.histogram
                 if (s.histogram && hist != null) Histogram(hist)
             }
+        }
+
+        // ---------- Panorama et calculs ----------
+        if (panoRunning) Column(
+            Modifier.align(Alignment.Center).padding(24.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xAA000000)).padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(if (panoFast) "Plus lentement !" else "➜  Tournez lentement vers la droite", color = if (panoFast) Color(0xFFFF6E6E) else Color.White, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            LinearProgressIndicator(progress = { (panoProgress / 8f).coerceIn(0f, 1f) }, color = Accent, modifier = Modifier.width(200.dp))
+            Text("Touchez le déclencheur pour terminer", color = Dim, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+        }
+        val proc = ctrl.processing
+        if (proc != null) Column(
+            Modifier.align(Alignment.Center).clip(RoundedCornerShape(16.dp)).background(Color(0xCC000000)).padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            CircularProgressIndicator(color = Accent)
+            Text(proc, color = Color.White, modifier = Modifier.padding(top = 12.dp))
         }
 
         // ---------- Messages ----------
@@ -569,21 +636,42 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
             }
 
             // Modes
-            Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                ModeTab("AUTO", !s.pro && !s.video) {
-                    if (!ctrl.recording) { ctrl.update(s.copy(pro = false, video = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
+            val isPhoto = !s.pro && !s.video
+            val modeList = listOf(
+                Triple("NUIT", isPhoto && s.special == 1) { s.copy(pro = false, video = false, special = 1) },
+                Triple("HDR", isPhoto && s.special == 2) { s.copy(pro = false, video = false, special = 2) },
+                Triple("AUTO", isPhoto && s.special == 0) { s.copy(pro = false, video = false, special = 0) },
+                Triple("PRO", s.pro && !s.video) { s.copy(pro = true, video = false) },
+                Triple("PANO", isPhoto && s.special == 3) { s.copy(pro = false, video = false, special = 3) },
+                Triple("VIDÉO", s.video && s.videoKind == 0) { s.copy(video = true, pro = false, videoKind = 0) },
+                Triple("RALENTI", s.video && s.videoKind == 1) { s.copy(video = true, pro = false, videoKind = 1) },
+                Triple("TIMELAPSE", s.video && s.videoKind == 2) { s.copy(video = true, pro = false, videoKind = 2) },
+            )
+            val modeScroll = rememberScrollState()
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(modeScroll).padding(horizontal = 12.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically
+            ) {
+                modeList.forEach { (label, selected, next) ->
+                    ModeTab(label, selected) {
+                        if (ctrl.recording || panoRunning || ctrl.busy) return@ModeTab
+                        if (label == "PRO" && caps?.manualSensor != true) {
+                            ctrl.message = "Réglages manuels ISO/vitesse non pris en charge par cette caméra"; return@ModeTab
+                        }
+                        val n = next()
+                        ctrl.update(n)
+                        if (n.pro) param = Param.ISO else if (param == Param.ISO || param == Param.SPEED) param = Param.EV
+                        ctrl.message = when (label) {
+                            "NUIT" -> "🌙 6 photos fusionnées : tenez le téléphone immobile"
+                            "HDR" -> "3 expositions fusionnées : ciel et ombres détaillés"
+                            "PANO" -> "Appuyez, puis tournez lentement vers la droite"
+                            "RALENTI" -> if (caps?.slowModes.isNullOrEmpty()) "Ralenti ×2 (60 i/s)" else "Ralenti haute vitesse"
+                            "TIMELAPSE" -> "Accéléré : 1 image toutes les ${fmtLapse(n.lapseMs)}"
+                            else -> null
+                        }
+                    }
                 }
-                Spacer(Modifier.width(14.dp))
-                ModeTab("PRO", s.pro && !s.video) {
-                    if (ctrl.recording) Unit
-                    else if (caps?.manualSensor == true) { ctrl.update(s.copy(pro = true, video = false)); param = Param.ISO }
-                    else ctrl.message = "Réglages manuels ISO/vitesse non pris en charge par cette caméra"
-                }
-                Spacer(Modifier.width(14.dp))
-                ModeTab("VIDÉO", s.video) {
-                    if (!ctrl.recording) { ctrl.update(s.copy(video = true, pro = false)); if (param == Param.ISO || param == Param.SPEED) param = Param.EV }
-                }
-                Spacer(Modifier.width(14.dp))
+                Spacer(Modifier.width(6.dp))
                 Text(
                     if (showPanel) "▾ Réglages" else "▴ Réglages", color = Dim, fontSize = 13.sp,
                     modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { showPanel = !showPanel }.padding(6.dp)
@@ -636,7 +724,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                     if (s.video && ctrl.recording) Box(Modifier.size(30.dp).clip(RoundedCornerShape(6.dp)).background(red))
                     else Box(
                         Modifier.fillMaxSize().padding(7.dp).clip(CircleShape)
-                            .background(if (ctrl.busy) Dim else if (s.video) red else if (s.pro) Accent else Color.White),
+                            .background(if (ctrl.busy) Dim else if (panoRunning) red else if (s.video) red else if (s.pro) Accent else Color.White),
                         contentAlignment = Alignment.Center
                     ) {
                         if (ctrl.burstCount > 0 && ctrl.busy && !s.video) Text("${ctrl.burstCount}", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 22.sp)
@@ -1049,6 +1137,8 @@ private fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
 // Valeurs et libellés
 
 private fun fmt1(v: Float) = "%.1f".format(Locale.FRANCE, v)
+
+private fun fmtLapse(ms: Int) = if (ms < 1000) "${ms / 1000.0}".replace('.', ',') + " s" else "${ms / 1000} s"
 
 private fun formatShutter(ns: Long): String {
     if (ns <= 0) return "—"
