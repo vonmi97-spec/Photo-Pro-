@@ -207,6 +207,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
     var param by remember { mutableStateOf(Param.ZOOM) }
     var showSettings by remember { mutableStateOf(false) }
     var showPanel by remember { mutableStateOf(true) }
+    var uiHidden by remember { mutableStateOf(false) }
 
     var textureRef by remember { mutableStateOf<TextureView?>(null) }
     val analyzer = remember { SceneAnalyzer() }
@@ -255,7 +256,10 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
                     detectTapGestures(
                         onTap = { o -> ctrl.tapToFocus(o.x / size.width, o.y / size.height) },
                         onLongPress = { o -> ctrl.lockAt(o.x / size.width, o.y / size.height) },
-                        onDoubleTap = { ctrl.switchCamera() }
+                        onDoubleTap = {
+                            uiHidden = !uiHidden
+                            if (uiHidden) ctrl.message = "Double-touchez pour réafficher les commandes"
+                        }
                     )
                 }
                 .pointerInput(Unit) {
@@ -284,7 +288,7 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
         }
 
         // ---------- Barre du haut ----------
-        Column(
+        if (!uiHidden) Column(
             Modifier.fillMaxWidth().align(Alignment.TopCenter)
                 .background(Brush.verticalGradient(listOf(Color(0xAA000000), Color.Transparent)))
                 .windowInsetsPadding(WindowInsets.displayCutout).padding(top = 8.dp)
@@ -378,8 +382,23 @@ private fun CameraScreen(ctrl: CameraController, onOpenPlayer: () -> Unit) {
             )
         }
 
+        // ---------- Mode image seule : petit déclencheur discret ----------
+        if (uiHidden) Box(
+            Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 28.dp)
+                .size(64.dp).clip(CircleShape).border(3.dp, Color(0xAAFFFFFF), CircleShape)
+                .clickable { ctrl.shoot() },
+            contentAlignment = Alignment.Center
+        ) {
+            val red = Color(0xFFE53935)
+            Box(
+                Modifier.size(if (s.video && ctrl.recording) 24.dp else 50.dp)
+                    .clip(if (s.video && ctrl.recording) RoundedCornerShape(5.dp) else CircleShape)
+                    .background(if (s.video) red.copy(alpha = 0.8f) else Color(0x88FFFFFF))
+            )
+        }
+
         // ---------- Commandes du bas ----------
-        Column(
+        if (!uiHidden) Column(
             Modifier.fillMaxWidth().align(Alignment.BottomCenter)
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000), Color(0xEE000000))))
                 .navigationBarsPadding().padding(top = 24.dp)
@@ -774,7 +793,7 @@ private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -
                     listOf(
                         "Toucher l'image" to "mise au point à cet endroit",
                         "Appui long sur l'image" to "verrouiller expo + mise au point",
-                        "Double toucher" to "caméra avant / arrière",
+                        "Double toucher" to "masquer / afficher les commandes",
                         "Pincer" to "zoomer",
                         "Appui long sur le déclencheur" to "rafale (30 photos)",
                     ).forEach { (g, d) ->
