@@ -65,7 +65,7 @@ data class CamSettings(
     val zoom: Float = 1f,
     val flash: FlashMode = FlashMode.OFF,
     val effect: Int = CameraMetadata.CONTROL_EFFECT_MODE_OFF,
-    val grid: Boolean = true,
+    val grid: Boolean = false,
     val timer: Int = 0,
     val quality: Int = 95,
     val wide: Boolean = false,

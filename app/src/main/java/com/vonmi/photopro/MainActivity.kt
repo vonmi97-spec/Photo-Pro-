@@ -561,13 +561,6 @@ private fun Overlay(ctrl: CameraController) {
     val roll = ctrl.rollDeg
     Canvas(Modifier.fillMaxSize()) {
         val w = size.width; val h = size.height
-        if (s.grid) {
-            val c = Color(0x66FFFFFF)
-            for (i in 1..2) {
-                drawLine(c, Offset(w * i / 3f, 0f), Offset(w * i / 3f, h), 1.5f)
-                drawLine(c, Offset(0f, h * i / 3f), Offset(w, h * i / 3f), 1.5f)
-            }
-        }
         if (s.level && abs(roll) < 30f) {
             val ok = abs(roll) < 1.0f
             val col = if (ok) Color(0xFF2ECC71) else Color(0xCCFFFFFF)
@@ -690,100 +683,162 @@ private fun LabelRow(title: String, value: String, onReset: (() -> Unit)?) {
 @Composable
 private fun SettingsDialog(ctrl: CameraController, caps: CamCaps?, onClose: () -> Unit) {
     val s = ctrl.settings
-    AlertDialog(
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.ui.window.Dialog(
         onDismissRequest = onClose,
-        confirmButton = { TextButton(onClick = onClose) { Text("Fermer") } },
-        title = { Text("Réglages") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text("Qualité JPEG", color = Dim, fontSize = 13.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(vertical = 6.dp)) {
-                    listOf(100 to "Max", 95 to "Haute", 85 to "Moyenne", 70 to "Légère").forEach { (q, n) ->
-                        Chip(n, s.quality == q) { ctrl.update(s.copy(quality = q)) }
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(Modifier.fillMaxSize().background(Color(0xFF0B0C0F)).systemBarsPadding()) {
+            // En-tête
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onClose) { Text("←", color = Color.White, fontSize = 22.sp) }
+                Text("Réglages", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            }
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Section("📷", "Photo") {
+                    ChoiceRow("Qualité", "Plus la qualité est haute, plus le fichier est lourd",
+                        listOf("Max" to 100, "Haute" to 95, "Moyenne" to 85, "Légère" to 70), s.quality) { ctrl.update(s.copy(quality = it)) }
+                    ChoiceRow("Format", caps?.let { "Photo : ${"%.1f".format(Locale.FRANCE, it.jpegSize.width * it.jpegSize.height / 1e6)} Mpx" },
+                        listOf("4:3" to false, "16:9" to true), s.wide) { ctrl.update(s.copy(wide = it)) }
+                    ToggleRow("Son du déclencheur", null, s.sound) { ctrl.update(s.copy(sound = it)) }
+                    ToggleRow("Boutons volume pour déclencher", "Volume + ou − prend la photo / lance la vidéo", s.volumeShutter) { ctrl.update(s.copy(volumeShutter = it)) }
+                }
+                Section("🎬", "Vidéo") {
+                    val heights = caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)
+                    ChoiceRow("Résolution", null, heights.map { (if (it == 2160) "4K" else "${it}p") to it }, s.videoRes) { ctrl.update(s.copy(videoRes = it)) }
+                    if (caps?.fps60 != null) ChoiceRow("Images par seconde", "60 i/s = mouvements plus fluides",
+                        listOf("30" to false, "60" to true), s.fps60) { ctrl.update(s.copy(fps60 = it)) }
+                    ToggleRow("Enregistrer le son", null, s.videoAudio) { ctrl.update(s.copy(videoAudio = it)) }
+                    if (caps?.ois == true || caps?.videoStab == true)
+                        ToggleRow("Stabilisation", "Réduit les tremblements", s.stabilization) { ctrl.update(s.copy(stabilization = it)) }
+                }
+                Section("🧭", "Affichage") {
+                    ToggleRow("Aperçu plein écran", "Désactivé : l'image entière de la photo est visible", s.fillPreview) { ctrl.update(s.copy(fillPreview = it)) }
+                    ToggleRow("Niveau (horizon)", "Ligne verte quand le téléphone est droit", s.level) { ctrl.update(s.copy(level = it)) }
+                    ToggleRow("Histogramme", "Répartition des zones sombres / claires", s.histogram) { ctrl.update(s.copy(histogram = it)) }
+                    if ((caps?.faceMode ?: 0) != 0)
+                        ToggleRow("Détection des visages", "Cadre les visages et fait la mise au point dessus", s.faces) { ctrl.update(s.copy(faces = it)) }
+                }
+                Section("✨", "Intelligence artificielle") {
+                    ToggleRow("Reconnaître la scène", "Nuit, portrait, paysage, nourriture, écran… (sur le téléphone, sans internet)", s.sceneAnalysis) { ctrl.update(s.copy(sceneAnalysis = it)) }
+                    if (s.sceneAnalysis)
+                        ToggleRow("Ajuster les réglages tout seul", "Adapte l'exposition et le mode selon la scène", s.sceneAuto) { ctrl.update(s.copy(sceneAuto = it)) }
+                    ToggleRow("Lire les QR codes", "Liens, Wi-Fi, texte", s.qr) { ctrl.update(s.copy(qr = it)) }
+                }
+                Section("🔭", "Objectifs (${ctrl.lenses.size})") {
+                    ctrl.lenses.forEach { l ->
+                        val parts = listOfNotNull(
+                            l.eqFocal?.let { "${it.roundToInt()} mm" },
+                            l.aperture?.let { "f/${fmt1(it)}" },
+                            if (l.megapixels > 0f) "${fmt1(l.megapixels)} Mpx" else null,
+                            if (l.minFocus > 0f) "autofocus" else "focus fixe",
+                            if (l.ois) "stabilisé" else null,
+                        )
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                                .background(if (caps?.id == l.id) Color(0x33FFC83D) else Color.Transparent)
+                                .clickable { ctrl.selectLens(l.id) }.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(l.chip, color = Accent, fontWeight = FontWeight.Bold, modifier = Modifier.width(86.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(l.kind + if (l.hidden) " · caché" else "", color = Color.White, fontSize = 15.sp)
+                                Text(parts.joinToString(" · "), color = Dim, fontSize = 12.sp)
+                            }
+                            if (caps?.id == l.id) Text("✓", color = Accent, fontSize = 18.sp)
+                        }
                     }
+                    Text("Touchez un objectif pour l'utiliser.", color = Dim, fontSize = 12.sp)
                 }
-                Text("Format", color = Dim, fontSize = 13.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(vertical = 6.dp)) {
-                    Chip("4:3 (pleine résolution)", !s.wide) { ctrl.update(s.copy(wide = false)) }
-                    Chip("16:9", s.wide) { ctrl.update(s.copy(wide = true)) }
-                }
-                if (caps != null) Text(
-                    "Photo : ${caps.jpegSize.width}×${caps.jpegSize.height} (${"%.1f".format(Locale.FRANCE, caps.jpegSize.width * caps.jpegSize.height / 1e6)} Mpx)",
-                    color = Dim, fontSize = 12.sp
-                )
-                Spacer(Modifier.height(10.dp))
-                Text("Vidéo", color = Dim, fontSize = 13.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(vertical = 6.dp)) {
-                    (caps?.videoHeights?.ifEmpty { null } ?: listOf(1080)).forEach { h ->
-                        Chip(if (h == 2160) "4K" else "${h}p", s.videoRes == h) { ctrl.update(s.copy(videoRes = h)) }
-                    }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(bottom = 6.dp)) {
-                    Chip("30 i/s", !s.fps60) { ctrl.update(s.copy(fps60 = false)) }
-                    if (caps?.fps60 != null) Chip("60 i/s", s.fps60) { ctrl.update(s.copy(fps60 = true)) }
-                }
-                SwitchRow("Enregistrer le son", s.videoAudio) { ctrl.update(s.copy(videoAudio = it)) }
-                Spacer(Modifier.height(10.dp))
-                Text("Analyse de scène (IA)", color = Dim, fontSize = 13.sp)
-                SwitchRow("Reconnaître la scène", s.sceneAnalysis) { ctrl.update(s.copy(sceneAnalysis = it)) }
-                if (s.sceneAnalysis) SwitchRow("Optimiser automatiquement", s.sceneAuto) { ctrl.update(s.copy(sceneAuto = it)) }
-                Text(
-                    "Nuit, portrait, paysage, nourriture, écran, document, animal, sport, neige, plage, coucher de soleil… " +
-                        "L'analyse se fait sur le téléphone, sans internet. Désactivée en mode PRO.",
-                    color = Dim, fontSize = 12.sp
-                )
-                Spacer(Modifier.height(10.dp))
-                Text("Objectifs détectés", color = Dim, fontSize = 13.sp)
-                ctrl.lenses.forEach { l ->
-                    val parts = listOfNotNull(
-                        l.eqFocal?.let { "${it.roundToInt()} mm éq." },
-                        l.aperture?.let { "f/${fmt1(it)}" },
-                        if (l.megapixels > 0f) "${fmt1(l.megapixels)} Mpx" else null,
-                        if (l.minFocus > 0f) "AF" else "fixe",
-                        if (l.ois) "OIS" else null,
-                        if (l.manual) "manuel" else null,
-                        if (l.raw) "RAW" else null,
-                    )
+                Section("📌", "Appli par défaut") {
                     Text(
-                        "${l.chip} — ${l.kind}${if (l.hidden) " (caché)" else ""}\n" + parts.joinToString(" · "),
-                        fontSize = 12.sp, modifier = Modifier.padding(vertical = 3.dp)
+                        "Photo Pro s'ouvre quand une appli demande une photo ou une vidéo, et dans « Ouvrir avec » pour les vidéos et les liens YouTube. Choisissez Photo Pro puis « Toujours ».",
+                        color = Dim, fontSize = 13.sp
                     )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            runCatching { ctx.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                        }) { Text("Applis par défaut") }
+                        OutlinedButton(onClick = {
+                            val i = if (Build.VERSION.SDK_INT >= 31)
+                                Intent(Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS, Uri.parse("package:" + ctx.packageName))
+                            else Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName))
+                            runCatching { ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                        }) { Text("Liens YouTube") }
+                    }
                 }
-                if (ctrl.lenses.count { !it.front } <= 1) Text(
-                    "Votre téléphone ne donne accès qu'à un objectif arrière aux applis tierces : utilisez le zoom.",
-                    color = Dim, fontSize = 12.sp
-                )
-                Spacer(Modifier.height(10.dp))
-                Text("Appli par défaut", color = Dim, fontSize = 13.sp)
-                val ctx = androidx.compose.ui.platform.LocalContext.current
-                OutlinedButton(onClick = {
-                    runCatching { ctx.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
-                        .onFailure { runCatching { ctx.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
-                }) { Text("Ouvrir les applis par défaut") }
-                Text(
-                    "Photo Pro apparaît quand une appli demande une photo ou une vidéo, et dans « Ouvrir avec » pour les vidéos : choisissez-le puis « Toujours ».",
-                    color = Dim, fontSize = 12.sp
-                )
-                Spacer(Modifier.height(8.dp))
-                SwitchRow("Aperçu plein écran", s.fillPreview) { ctrl.update(s.copy(fillPreview = it)) }
-                if ((caps?.faceMode ?: 0) != 0) SwitchRow("Détection des visages", s.faces) { ctrl.update(s.copy(faces = it)) }
-                SwitchRow("Lecteur de QR codes", s.qr) { ctrl.update(s.copy(qr = it)) }
-                SwitchRow("Histogramme", s.histogram) { ctrl.update(s.copy(histogram = it)) }
-                SwitchRow("Grille (règle des tiers)", s.grid) { ctrl.update(s.copy(grid = it)) }
-                SwitchRow("Niveau / horizon", s.level) { ctrl.update(s.copy(level = it)) }
-                if (caps?.ois == true || caps?.videoStab == true) SwitchRow("Stabilisation", s.stabilization) { ctrl.update(s.copy(stabilization = it)) }
-                SwitchRow("Son du déclencheur", s.sound) { ctrl.update(s.copy(sound = it)) }
-                SwitchRow("Boutons volume = déclencher", s.volumeShutter) { ctrl.update(s.copy(volumeShutter = it)) }
-                Spacer(Modifier.height(8.dp))
-                Text("Astuces : touchez l'image pour faire la mise au point, appui long pour verrouiller expo + mise au point, double-touche pour changer de caméra, pincez pour zoomer. Appui long sur le déclencheur = rafale (30 photos max). En vidéo : pause ❚❚ et photo 📸 pendant l'enregistrement.", color = Dim, fontSize = 12.sp)
-                Spacer(Modifier.height(10.dp))
-                OutlinedButton(onClick = {
-                    ctrl.resetFocus()
-                    ctrl.update(CamSettings(wide = s.wide, video = s.video, videoRes = s.videoRes))
-                }) { Text("Réinitialiser les réglages photo") }
+                Section("💡", "Gestes") {
+                    listOf(
+                        "Toucher l'image" to "mise au point à cet endroit",
+                        "Appui long sur l'image" to "verrouiller expo + mise au point",
+                        "Double toucher" to "caméra avant / arrière",
+                        "Pincer" to "zoomer",
+                        "Appui long sur le déclencheur" to "rafale (30 photos)",
+                    ).forEach { (g, d) ->
+                        Row { Text(g, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f)); Text(d, color = Dim, fontSize = 13.sp) }
+                    }
+                }
+                OutlinedButton(
+                    onClick = { ctrl.resetFocus(); ctrl.update(CamSettings(wide = s.wide, video = s.video, videoRes = s.videoRes)) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Réinitialiser les réglages photo") }
+                Spacer(Modifier.height(24.dp))
             }
         }
-    )
+    }
+}
+
+@Composable
+private fun Section(icon: String, title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Panel).padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("$icon  $title", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+        content()
+    }
+}
+
+@Composable
+private fun ToggleRow(title: String, subtitle: String?, value: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onChange(!value) },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f).padding(end = 10.dp)) {
+            Text(title, color = Color.White, fontSize = 15.sp)
+            if (subtitle != null) Text(subtitle, color = Dim, fontSize = 12.sp)
+        }
+        Switch(
+            checked = value, onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = Accent)
+        )
+    }
+}
+
+@Composable
+private fun <T> ChoiceRow(title: String, subtitle: String?, options: List<Pair<String, T>>, selected: T, onSelect: (T) -> Unit) {
+    Column {
+        Text(title, color = Color.White, fontSize = 15.sp)
+        if (subtitle != null) Text(subtitle, color = Dim, fontSize = 12.sp)
+        Row(
+            Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFF0B0C0F)).padding(3.dp)
+        ) {
+            options.forEach { (label, v) ->
+                val on = v == selected
+                Box(
+                    Modifier.weight(1f).clip(RoundedCornerShape(10.dp)).background(if (on) Accent else Color.Transparent)
+                        .clickable { onSelect(v) }.padding(vertical = 9.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(label, color = if (on) Color.Black else Color.White, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal, fontSize = 14.sp)
+                }
+            }
+        }
+    }
 }
 
 @Composable
