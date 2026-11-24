@@ -32,6 +32,19 @@ jobs:
           else
             echo "::warning::Secret KEYSTORE_BASE64 absent : signature temporaire"
           fi
+      - name: Vérifier la clé
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -f app/release.jks ]; then
+            H=$(sha256sum app/release.jks | cut -c1-16)
+            P=$(printf '%s' "$KEYSTORE_PASSWORD" | wc -c)
+            echo "::notice::Empreinte clé $H, mot de passe $P caractères"
+            if ! keytool -list -keystore app/release.jks -storepass "$KEYSTORE_PASSWORD" -alias photopro > /dev/null 2>&1; then
+              echo "::error::Clé refusée (empreinte $H, mot de passe $P caractères)"
+              exit 1
+            fi
+          fi
       - name: Compiler l'APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
